@@ -19,7 +19,7 @@ def run_swirl(data_snapshot):
     vortices = swirl.Identification(v=[u_plot, v_plot],
                                     grid_dx=[dx, dy],
                                     param_file=f'./swirl_params/{params_file}.param',
-                                    verbose=True)
+                                    verbose=False)
     vortices.run()
 
     return vortices
