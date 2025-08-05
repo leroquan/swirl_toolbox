@@ -1,0 +1,5 @@
+{
+  "i_mitgcm_folder_path":  "../run",
+  "swirl_params_name": "swirl_03",
+  "output_folder": "../output"
+}

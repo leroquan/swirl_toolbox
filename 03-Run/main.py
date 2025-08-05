@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime
 from collections import namedtuple
+import json
 
 import xarray as xr
 
@@ -18,11 +19,6 @@ from functions.create_lvl0 import compute_ke_snapshot, extract_eddy_data
 import dask
 from dask import delayed, compute
 
-
-I_MITGCM_FOLDER_PATH = r"../run" # Folder containing tiled mitgcm results
-SWIRL_PARAMS_NAME = 'swirl_03'
-MODEL = 'geneva_200m'
-OUTPUT_FOLDER = r'../output'
 
 O_MITGCM_FOLDER_NAME = 'mitgcm_results'
 O_GRID_FOLDER_NAME = 'grid'
@@ -36,9 +32,9 @@ SwirlInputData = namedtuple('SwirlInputData', [
 
 
 # Extract and compute numpy arrays BEFORE passing to dask (improves reading data time)
-def load_input_data(mitgcm_nc_results_path, time_indices=None, depth_indices=None):
+def load_input_data(mitgcm_nc_results_path, output_folder, time_indices=None, depth_indices=None):
     ds_mitgcm = open_mncdataset(os.path.join(mitgcm_nc_results_path, '3Dsnaps'), 12, 48)
-    ds_grid = xr.open_dataset(os.path.join(OUTPUT_FOLDER, O_GRID_FOLDER_NAME, 'merged_grid.nc'))
+    ds_grid = xr.open_dataset(os.path.join(output_folder, O_GRID_FOLDER_NAME, 'merged_grid.nc'))
 
     times = ds_mitgcm.T.values
     depths = ds_grid.Z.values
@@ -88,16 +84,23 @@ def get_str_current_time():
 
 
 def main():
+    with open('config_postprocessing.json', 'r') as file:
+        postprocessing_config = json.load(file)
+
+    i_mitgcm_folder_path = postprocessing_config['i_mitgcm_folder_path']  # Folder containing tiled mitgcm results
+    swirl_params_name = postprocessing_config['swirl_params_name']
+    output_folder = postprocessing_config['output_folder']
+
     dask.config.set(scheduler='threads')
     #---------------------------------
     print(f'Loading input data... ({get_str_current_time()})')
-    swirl_input_data = load_input_data(I_MITGCM_FOLDER_PATH)
+    swirl_input_data = load_input_data(i_mitgcm_folder_path, output_folder)
     start_date_str = pd.Timestamp(swirl_input_data.ds_mitgcm.T.values[0]).strftime('%Y%m%d')
     end_date_str = pd.Timestamp(swirl_input_data.ds_mitgcm.T.values[-1]).strftime('%Y%m%d')
 
     # ---------------------------------
     print(f'Saving merged mitgcm results... ({get_str_current_time()})')
-    swirl_input_data.ds_mitgcm.to_zarr(os.path.join(OUTPUT_FOLDER, O_MITGCM_FOLDER_NAME, rf"mitgcm_{start_date_str}_{end_date_str}.zarr"), 
+    swirl_input_data.ds_mitgcm.to_zarr(os.path.join(output_folder, O_MITGCM_FOLDER_NAME, rf"mitgcm_{start_date_str}_{end_date_str}.zarr"),
                         mode="w", 
                         compute=True, 
                         consolidated=False)
@@ -117,7 +120,7 @@ def main():
             theta = swirl_input_data.theta_data[ti, di].T
             tasks[(t_idx, d_idx)] = delayed(run_swirl_and_create_lvl0)(uvel, vvel, wvel, theta,
                                                                        swirl_input_data.dx, swirl_input_data.dy, dz,
-                                                                       SWIRL_PARAMS_NAME,
+                                                                       swirl_params_name,
                                                                        date, depth,
                                                                        ti, di)
 
@@ -128,7 +131,7 @@ def main():
     df_catalogue_level0 = pd.concat([row for row in results], ignore_index=True)
 
     # ---------------------------------
-    output_path = os.path.join(OUTPUT_FOLDER, O_LVL0_FOLDER_NAME, f'lvl0_{start_date_str}_{end_date_str}.csv')
+    output_path = os.path.join(output_folder, O_LVL0_FOLDER_NAME, f'lvl0_{start_date_str}_{end_date_str}.csv')
     print(f'Saving catalogue level 0 to {output_path}... ({get_str_current_time()})')
     df_catalogue_level0.to_csv(output_path, index=False)
     
