@@ -13,7 +13,7 @@ dask.config.set(scheduler='processes', num_workers=576)
 datapath = r"../run"
 gridpath = r"../run"
 ref_date = "2024-03-01 0:0:0"
-dt_mitgcm_results = 32
+dt_mitgcm_results = 60
 endian = '>'
 swirl_params_file_name = 'swirl_03'
 model = 'geneva_200m'
@@ -100,7 +100,7 @@ def main():
     # ---------------------------------
     print('Detecting eddies and creating level 0 catalogue...')
     depth_indices = range(len(ds_mitgcm.Z.values))
-    time_indices = range(24)
+    time_indices = range(len(ds_mitgcm.time.values))
 
     start_opening_data = time.time()
     dx, dy, dz_array, uvel_data, vvel_data, wvel_data = load_input_data(ds_mitgcm, time_indices, depth_indices)
@@ -125,7 +125,8 @@ def main():
     # Create final DataFrame
     df_catalogue_level0 = pd.concat([row for row in results], ignore_index=True)
 
-    lvl0_output_filename = f'{model}_{swirl_params_file_name}_day{ds_mitgcm.time.values[0]}_lvl0.csv'
+    date_str = ds_mitgcm.time.values[0].astype('datetime64[ms]').astype(object).strftime('%Y%m%d')
+    lvl0_output_filename = f'{model}_{swirl_params_file_name}_day{date_str}_lvl0.csv'
     output_path = os.path.join(output_folder, lvl0_output_filename)
 
     # ---------------------------------
