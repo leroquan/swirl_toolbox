@@ -36,6 +36,7 @@ def extract_eddy_data(indices_eddy, eddy, date, depth, dz, ke_grid_megajoules, s
         'kinetic_energy_lake_[MJ]': float(ke_lake),
         'mean_temperature_eddy_[°C]': mean_temperature_eddy,
         'mean_temperature_lake_[°C]': mean_temperature_lake,
-        'i_eddy_cells': eddy.vortex_cells[0],
-        'j_eddy_cells': eddy.vortex_cells[1]
+        # convert arrays to comma-separated strings so CSV keeps all values
+        'i_eddy_cells': ",".join(map(str, eddy.vortex_cells[0])),
+        'j_eddy_cells': ",".join(map(str, eddy.vortex_cells[1]))
     }
