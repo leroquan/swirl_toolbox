@@ -68,8 +68,7 @@ def main(config_path = '..//postprocessing//config_postprocessing.json'):
         swirl_input_data = load_input_data_netcdf(pp_config['i_mitgcm_folder_path'],
                                                   pp_config['output_folder'],
                                                   O_GRID_FOLDER_NAME,
-                                                  pp_config['px'], pp_config['py'],
-                                                  is_zarr=pp_config['is_zarr'])
+                                                  pp_config['px'], pp_config['py'])
     elif pp_config['mitgcm_output_format'] == 'binary':
         swirl_input_data = load_input_data_binary(pp_config['i_mitgcm_folder_path'],
                                                  pp_config['binary_mitgcm_grid_folder_path'],

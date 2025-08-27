@@ -67,8 +67,7 @@ SwirlInputData = namedtuple('SwirlInputData', [
 
 
 # Extract and compute numpy arrays BEFORE passing to dask (improves reading data time)
-def load_input_data_netcdf(mitgcm_nc_results_path, output_folder, output_grid_folder_name, px, py, time_indices=None, depth_indices=None,
-                           is_zarr='False'):
+def load_input_data_netcdf(mitgcm_nc_results_path, output_folder, output_grid_folder_name, px, py, time_indices=None, depth_indices=None):
     """
     :return: namedtuple('SwirlInputData', [
     'ds_mitgcm', 'times', 'depths', 'time_indices', 'depth_indices',
