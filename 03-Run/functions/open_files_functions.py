@@ -1,8 +1,49 @@
 import glob
 import os
+import numpy as np
+import pandas as pd
 import xarray as xr
+import json
 from collections import namedtuple
 import xmitgcm as xm
+
+
+SwirlInputData = namedtuple('SwirlInputData', [
+    'ds_mitgcm', 'times', 'depths',
+    'dx', 'dy', 'dz_array'
+])
+
+
+class MitgcmGrid:
+    """Class representing an MITgcm grid, with optional loading from .npy files."""
+
+    def __init__(self):
+        self.x = np.array([])
+        self.y = np.array([])
+        self.lat_grid = np.array([])
+        self.lon_grid = np.array([])
+        self.dz = np.array([])
+        self.parameters = {}
+
+    def load_from_path(self, path_grid: str):
+        try:
+            self.x = np.load(os.path.join(path_grid, 'x.npy'))
+            self.y = np.load(os.path.join(path_grid, 'y.npy'))
+            self.lat_grid = np.load(os.path.join(path_grid, 'lat_grid.npy'))
+            self.lon_grid = np.load(os.path.join(path_grid, 'lon_grid.npy'))
+            self.dz = pd.read_csv(os.path.join(path_grid, 'dz.csv'), header=None).to_numpy()
+            with open(os.path.join(path_grid, 'parameters.json'), 'r') as file:
+                self.parameters = json.load(file)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Missing grid file: {e.filename}") from e
+        except Exception as e:
+            raise RuntimeError(f"Error loading grid data: {e}") from e
+
+
+def get_mitgcm_grid(path_folder_grid: str) -> MitgcmGrid:
+    grid = MitgcmGrid()
+    grid.load_from_path(path_folder_grid)
+    return grid
 
 
 def fix_dimension(ds, bad_dim, new_dim, trim=True):
@@ -31,7 +72,7 @@ def reset_dimensions(ds, orig_dim, new_dim, *reset_vars):
     # reindexing necessary to figure out new dims
     return ds.reindex()
 
-def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
+def bk_open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
     if iternum is not None:
         itersuf = '.%010d' % iternum
     else:
@@ -46,7 +87,7 @@ def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
             ntile = nx + ntiles_x*ny + 1
             fname = fname_base + '%s.t%03d.nc' % (itersuf, ntile)
             ds = xr.open_dataset(fname)
-            ds, swapped_vars_x = fix_dimension(ds, 'Xp1', 'X')    
+            ds, swapped_vars_x = fix_dimension(ds, 'Xp1', 'X')
             ds = ds.chunk()
             dsets_x.append(ds)
         ds_xconcat = xr.concat(dsets_x, 'X')
@@ -59,78 +100,115 @@ def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
     return ds
 
 
-SwirlInputData = namedtuple('SwirlInputData', [
-    'ds_mitgcm', 'times', 'depths', 'time_indices', 'depth_indices',
-    'dx', 'dy', 'dz_array',
-    'uvel_data', 'vvel_data', 'wvel_data', 'theta_data'
-])
+def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
+    if iternum is not None:
+        itersuf = f".{iternum:010d}"
+    else:
+        flist = glob.glob(fname_base + "*.nc")
+        flist = [os.path.basename(f) for f in flist]
+        itersuf = f".{int(flist[0].split('.')[1]):010d}"
+
+    # Build full list of tile files
+    fnames = []
+    for ny in range(ntiles_y):
+        for nx in range(ntiles_x):
+            ntile = nx + ntiles_x * ny + 1
+            fname = fname_base + f"{itersuf}.t{ntile:03d}.nc"
+            fnames.append(fname)
+
+    # Open all files at once
+    ds = xr.open_mfdataset(
+        fnames,
+        concat_dim=["Y", "X"],   # <-- may need adjustment depending on how your dims are labeled
+        combine="nested",        # combine based on position in list
+        chunks={"time": 1, "X": 100, "Y": 100},     # let user pick Dask chunking
+        engine="h5netcdf",       # faster/more robust than netCDF4
+        parallel=True            # allows concurrent file opening
+    )
+
+    # Apply your fixes
+    ds, _ = fix_dimension(ds, "Xp1", "X")
+    ds, _ = fix_dimension(ds, "Yp1", "Y")
+
+    return ds
 
 
-# Extract and compute numpy arrays BEFORE passing to dask (improves reading data time)
-def load_input_data_netcdf(mitgcm_nc_results_path, output_folder, output_grid_folder_name, px, py, time_indices=None, depth_indices=None):
+def _standardize_dims(ds, kind="netcdf"):
     """
-    :return: namedtuple('SwirlInputData', [
-    'ds_mitgcm', 'times', 'depths', 'time_indices', 'depth_indices',
-    'dx', 'dy', 'dz_array',
-    'uvel_data', 'vvel_data', 'wvel_data', 'theta_data'
-    ])
+    Rename dims/coords so both code paths expose:
+      T (time), Z (mid), Zl (lower), Y, X
+    and variables UVEL/VVEL use (T,Z,Y,X), WVEL uses (T,Zl,Y,X), THETA uses (T,Z,Y,X).
     """
+    if kind == "netcdf":
+        # common MITgcm NetCDF export names from your snippet
+        ren = {
+            'T': 'time',
+            'Zmd000100': 'Z',   # mid
+            'Zld000100': 'Zl',  # lower
+        }
+        # already OK for Y, X after open_mncdataset
+        ds = ds.rename({k: v for k, v in ren.items() if k in ds.dims})
+    else:  # binary (xmitgcm)
+        # xmitgcm default dims are usually: time, Z, Zl, YC, XC
+        ren = {}
+        #if 'time' in ds.dims: ren['time'] = 'T'
+        # Z and Zl already match desired names
+        ds = ds.rename(ren)
+
+    return ds
+
+
+def _ensure_native_endian(mitgcm_ds):
+    mitgcm_ds = mitgcm_ds.astype('<f8')
+    mitgcm_ds = mitgcm_ds.assign(Z=mitgcm_ds['Z'].astype('<f8'))
+    mitgcm_ds = mitgcm_ds.assign(XC=mitgcm_ds['XC'].astype('<f8'))
+    mitgcm_ds = mitgcm_ds.assign(YC=mitgcm_ds['YC'].astype('<f8'))
+    mitgcm_ds = mitgcm_ds.assign(XG=mitgcm_ds['XG'].astype('<f8'))
+    mitgcm_ds = mitgcm_ds.assign(YG=mitgcm_ds['YG'].astype('<f8'))
+    mitgcm_ds = mitgcm_ds.assign(Zl=mitgcm_ds['Zl'].astype('<f8'))
+
+    return mitgcm_ds
+
+
+def load_input_data_netcdf(mitgcm_nc_results_path, output_folder, output_grid_folder_name, px, py, endian ='>'):
     ds_mitgcm = open_mncdataset(os.path.join(mitgcm_nc_results_path, '3Dsnaps'), py, px)
+    ds_mitgcm = _standardize_dims(ds_mitgcm, kind="netcdf").chunk({'time': 1, 'Z': 10, 'Zl': 10})
+    if endian == '>':
+        ds_mitgcm = _ensure_native_endian(ds_mitgcm)
 
     ds_grid = xr.open_dataset(str(os.path.join(output_folder, output_grid_folder_name, 'merged_grid.nc')))
 
-    times = ds_mitgcm.T.values
-    depths = ds_grid.Z.values
+    times = ds_mitgcm['time'].values
+    depths = ds_grid['Z'].values
 
-    if time_indices == None:
-        time_indices = range(len(times))
-    if depth_indices == None:
-        depth_indices = range(len(depths))
-
-    dx = ds_grid.dxC.values[0][0]
-    dy = ds_grid.dyC.values[0][0]
+    dx = float(ds_grid.dxC.values[0][0])
+    dy = float(ds_grid.dyC.values[0][0])
     dz_array = ds_grid.drC.values
-    uvel_data = ds_mitgcm['UVEL'].isel(T=time_indices, Zmd000100=depth_indices).fillna(0).values
-    vvel_data = ds_mitgcm['VVEL'].isel(T=time_indices, Zmd000100=depth_indices).fillna(0).values
-    wvel_data = ds_mitgcm['WVEL'].isel(T=time_indices, Zld000100=depth_indices).fillna(0).values
-    theta_data = ds_mitgcm['THETA'].isel(T=time_indices, Zmd000100=depth_indices).fillna(0).values
 
-    return SwirlInputData(ds_mitgcm,
-                          times, depths,
-                          time_indices, depth_indices,
-                          dx, dy, dz_array,
-                          uvel_data, vvel_data, wvel_data, theta_data)
+    return SwirlInputData(ds_mitgcm, times, depths, dx, dy, dz_array)
 
 
-# Extract and compute numpy arrays BEFORE passing to dask (improves reading data time)
 def load_input_data_binary(mitgcm_bin_results_path, binary_mitgcm_grid_folder_path, ref_date, dt_mitgcm_results,
-                           time_indices=None, depth_indices=None):
+                           endian='>'):
     ds_mitgcm = xm.open_mdsdataset(
-                                mitgcm_bin_results_path,
-                                grid_dir=binary_mitgcm_grid_folder_path,
-                                ref_date=ref_date,
-                                prefix='3Dsnaps',
-                                delta_t=dt_mitgcm_results,
-                                endian=">")
+        mitgcm_bin_results_path,
+        grid_dir=binary_mitgcm_grid_folder_path,
+        ref_date=ref_date,
+        prefix='3Dsnaps',
+        delta_t=dt_mitgcm_results,
+        endian=endian
+    )
 
-    times = ds_mitgcm.time.values
-    depths = ds_mitgcm.Z.values
+    ds_mitgcm = _standardize_dims(ds_mitgcm, kind="binary").chunk({'time': 1, 'Z': 10, 'Zl': 10})
+    if endian == '>':
+        ds_mitgcm = _ensure_native_endian(ds_mitgcm)
 
-    if time_indices == None:
-        time_indices = range(len(times))
-    if depth_indices == None:
-        depth_indices = range(len(depths))
+    times = ds_mitgcm['time'].values
+    depths = ds_mitgcm['Z'].values
 
-    dx = ds_mitgcm.dxC.values[0][0]
-    dy = ds_mitgcm.dyC.values[0][0]
+    dx = float(ds_mitgcm.dxC.values[0][0])
+    dy = float(ds_mitgcm.dyC.values[0][0])
     dz_array = ds_mitgcm.drC.values
-    uvel_data = ds_mitgcm['UVEL'].isel(time=time_indices, Z=depth_indices).fillna(0).values
-    vvel_data = ds_mitgcm['VVEL'].isel(time=time_indices, Z=depth_indices).fillna(0).values
-    wvel_data = ds_mitgcm['WVEL'].isel(time=time_indices, Zl=depth_indices).fillna(0).values
-    theta_data = ds_mitgcm['THETA'].isel(time=time_indices, Z=depth_indices).fillna(0).values
 
-    return SwirlInputData(ds_mitgcm,
-                          times, depths,
-                          time_indices,depth_indices,
-                          dx, dy, dz_array,
-                          uvel_data, vvel_data, wvel_data, theta_data)
+    return SwirlInputData(ds_mitgcm, times, depths,
+                          dx, dy, dz_array)

@@ -6,7 +6,8 @@ def plot_map_swirl(uvel, vvel, vortices, title, stream_density):
     # rortex
     plt.close('all')
     fig = plt.figure(figsize=(15, 5))
-    plt.imshow(vortices.rortex[0].T, cmap='PiYG', vmin=-0.001, vmax=0.001)
+    if len(vortices) > 0:
+        plt.imshow(vortices.rortex[0].T, cmap='PiYG', vmin=-0.001, vmax=0.001)
     plt.gca().invert_yaxis()
     cbar = plt.colorbar()
     cbar.set_label('Rortex R')
