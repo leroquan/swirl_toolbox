@@ -71,6 +71,28 @@ def run_parallel_task(u, v, w, theta,
     return pd.concat([pd.DataFrame([r]) for r in eddy_rows], ignore_index=True)
 
 
+def compute_lake_properties(swirl_input_data, uvel_data, vvel_data, wvel_data, theta_data):
+    ke_lake = []
+    for ti, date in enumerate(pd.to_datetime(swirl_input_data.times).to_pydatetime()):
+        for di, depth_val in enumerate(swirl_input_data.depths):
+            u = uvel_data[ti, di].T
+            v = vvel_data[ti, di].T
+            w = wvel_data[ti, di].T
+            theta = theta_data[ti, di].T
+
+            ke_slice = compute_ke_snapshot(u, v, w, swirl_input_data.dx, swirl_input_data.dy,
+                                           dz=swirl_input_data.dz_array[di]).sum()
+            mean_temperature = theta[theta > 0].mean()
+            surface = len(theta[theta > 0]) * swirl_input_data.dx * swirl_input_data.dy
+            volume = surface * swirl_input_data.dz_array[di]
+
+            ke_lake.append({'time_index': ti, 'depth_index': di, 'date': date, 'depth_[m]': depth_val,
+                            'surface_area_[m2]': surface, 'volume_slice_[m3]': volume,
+                            'kinetic_energy_[MJ]': ke_slice, 'mean_temperature_lake_[°C]': mean_temperature})
+
+    return ke_lake
+
+
 def main(config_path='..//postprocessing//config_postprocessing.json'):
     with open(config_path, 'r') as f:
         pp_config = json.load(f)
@@ -121,26 +143,11 @@ def main(config_path='..//postprocessing//config_postprocessing.json'):
     wvel_data = ds.WVEL.values
     theta_data = ds.THETA.values
 
-    print(f'Computing lake characteristics... ({get_str_current_time()})')
-    ke_lake = []
-    for ti, date in enumerate(pd.to_datetime(swirl_input_data.times).to_pydatetime()):
-        for di, depth_val in enumerate(swirl_input_data.depths):
-            u = uvel_data[ti, di].T
-            v = vvel_data[ti, di].T
-            w = wvel_data[ti, di].T
-            theta = theta_data[ti, di].T
+    print(f'Computing lake properties... ({get_str_current_time()})')
+    ke_lake = compute_lake_properties(swirl_input_data,
+                                      uvel_data, vvel_data, wvel_data, theta_data)
 
-            ke_slice = compute_ke_snapshot(u, v, w, swirl_input_data.dx, swirl_input_data.dy,
-                                           dz=swirl_input_data.dz_array[di]).sum()
-            mean_temperature = theta[theta > 0].mean()
-            surface = len(theta[theta > 0]) * swirl_input_data.dx * swirl_input_data.dy
-            volume = surface * swirl_input_data.dz_array[di]
-
-            ke_lake.append({'time_index': ti, 'depth_index': di, 'date': date, 'depth_[m]': depth_val,
-                            'surface_area_[m2]': surface, 'volume_slice_[m3]': volume,
-                            'kinetic_energy_[MJ]': ke_slice, 'mean_temperature_lake_[°C]': mean_temperature})
-
-    print(f'Saving lake characteristics... ({get_str_current_time()})')
+    print(f'Saving lake properties... ({get_str_current_time()})')
     lvl0_out_dir = os.path.join(pp_config['output_folder'], O_LVL0_FOLDER_NAME)
     os.makedirs(lvl0_out_dir, exist_ok=True)
     output_path = os.path.join(lvl0_out_dir, f'lake_characteristics_{start_date_str}_{end_date_str}.csv')
