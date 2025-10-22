@@ -2,12 +2,16 @@
   "i_mitgcm_folder_path":  "/storage/alplakes_test/geneva_200m/run_10min/",
   "swirl_params_path": "./swirl_params/swirl_03.param",
   "output_folder": "./outputs",
-  "save_nc_mitgcm": "True",
+  "save_nc_mitgcm": true,
   "grid_folder": "/storage/alplakes_test/geneva_200m/",
   "px": 3,
   "py": 3,
+  "time_chunk_size": "auto",
+  "depth_chunk_size": "auto",
+  "target_tasks_multiplier": 3.0,
   "mitgcm_output_format": "binary",
   "binary_mitgcm_grid_folder_path":  "/storage/alplakes_test/geneva_200m/metadata/",
   "binary_ref_date": "2023-03-01 0:0:0",
-  "binary_dt": 32
+  "binary_dt": 32,
+  "verbose": false
 }
