@@ -7,6 +7,7 @@ import json
 from collections import namedtuple
 import xmitgcm as xm
 
+_chunking = {'time': 1, 'Z': 1, 'Zl': 1}
 
 SwirlInputData = namedtuple('SwirlInputData', [
     'ds_mitgcm', 'times', 'depths',
@@ -72,34 +73,6 @@ def reset_dimensions(ds, orig_dim, new_dim, *reset_vars):
     # reindexing necessary to figure out new dims
     return ds.reindex()
 
-def bk_open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
-    if iternum is not None:
-        itersuf = '.%010d' % iternum
-    else:
-        flist = glob.glob(fname_base + "*.nc")
-        flist = [os.path.basename(f) for f in flist]
-        itersuf = '.%010d' % int(flist[0].split('.')[1])
-    dsets_y = []
-    for ny in range(ntiles_y):
-        dsets_x = []
-        swap_vars = set()
-        for nx in range(ntiles_x):
-            ntile = nx + ntiles_x*ny + 1
-            fname = fname_base + '%s.t%03d.nc' % (itersuf, ntile)
-            ds = xr.open_dataset(fname)
-            ds, swapped_vars_x = fix_dimension(ds, 'Xp1', 'X')
-            ds = ds.chunk()
-            dsets_x.append(ds)
-        ds_xconcat = xr.concat(dsets_x, 'X')
-        ds_xconcat, swapped_vars_y = fix_dimension(ds_xconcat, 'Yp1', 'Y')
-        dsets_y.append(ds_xconcat)
-    ds = xr.concat(dsets_y, 'Y')
-    ds = reset_dimensions(ds, 'Xp1', 'X', *swapped_vars_x)
-    ds = reset_dimensions(ds, 'Yp1', 'Y', *swapped_vars_y)
-
-    return ds
-
-
 def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
     if iternum is not None:
         itersuf = f".{iternum:010d}"
@@ -121,7 +94,7 @@ def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
         fnames,
         concat_dim=["Y", "X"],   # <-- may need adjustment depending on how your dims are labeled
         combine="nested",        # combine based on position in list
-        chunks={"time": 1, "X": 100, "Y": 100},     # let user pick Dask chunking
+        chunks=_chunking,     # let user pick Dask chunking
         engine="h5netcdf",       # faster/more robust than netCDF4
         parallel=True            # allows concurrent file opening
     )
@@ -170,13 +143,13 @@ def _ensure_native_endian(mitgcm_ds):
     return mitgcm_ds
 
 
-def load_input_data_netcdf(mitgcm_nc_results_path, output_folder, output_grid_folder_name, px, py, endian ='>'):
+def load_input_data_netcdf(mitgcm_nc_results_path, grid_nc_path, px, py, endian ='>'):
     ds_mitgcm = open_mncdataset(os.path.join(mitgcm_nc_results_path, '3Dsnaps'), py, px)
-    ds_mitgcm = _standardize_dims(ds_mitgcm, kind="netcdf").chunk({'time': 1, 'Z': 10, 'Zl': 10})
+    ds_mitgcm = _standardize_dims(ds_mitgcm, kind="netcdf")
     if endian == '>':
         ds_mitgcm = _ensure_native_endian(ds_mitgcm)
 
-    ds_grid = xr.open_dataset(str(os.path.join(output_folder, output_grid_folder_name, 'merged_grid.nc')))
+    ds_grid = xr.open_dataset(str(grid_nc_path))
 
     times = ds_mitgcm['time'].values
     depths = ds_grid['Z'].values
@@ -188,7 +161,7 @@ def load_input_data_netcdf(mitgcm_nc_results_path, output_folder, output_grid_fo
     return SwirlInputData(ds_mitgcm, times, depths, dx, dy, dz_array)
 
 
-def load_input_data_binary(mitgcm_bin_results_path, binary_mitgcm_grid_folder_path, ref_date, dt_mitgcm_results,
+def load_input_data_binary(mitgcm_bin_results_path, binary_mitgcm_grid_folder_path, ref_date, dt_mitgcm_results, iter,
                            endian='>'):
     ds_mitgcm = xm.open_mdsdataset(
         mitgcm_bin_results_path,
@@ -199,7 +172,7 @@ def load_input_data_binary(mitgcm_bin_results_path, binary_mitgcm_grid_folder_pa
         endian=endian
     )
 
-    ds_mitgcm = _standardize_dims(ds_mitgcm, kind="binary").chunk({'time': 1, 'Z': 10, 'Zl': 10})
+    ds_mitgcm = _standardize_dims(ds_mitgcm, kind="binary")
     if endian == '>':
         ds_mitgcm = _ensure_native_endian(ds_mitgcm)
 
