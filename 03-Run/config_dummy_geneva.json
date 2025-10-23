@@ -1,0 +1,14 @@
+{
+  "i_mitgcm_folder_path":  "/home/leroquan@eawag.wroot.emp-eaw.ch/work_space/dummy_7ms/run",
+  "swirl_params_path": "./swirl_params/swirl_06.param",
+  "output_folder": "/home/leroquan@eawag.wroot.emp-eaw.ch/work_space/dummy_7ms/output_swirl",
+  "save_nc_mitgcm": "False",
+  "grid_folder": "/home/leroquan@eawag.wroot.emp-eaw.ch/work_space/dummy_7ms/grid/",
+  "px": 12,
+  "py": 3,
+  "mitgcm_output_format": "binary",
+  "binary_mitgcm_grid_folder_path":  "/home/leroquan@eawag.wroot.emp-eaw.ch/work_space/dummy_7ms/run",
+  "binary_ref_date": "2025-07-01 0:0:0",
+  "binary_dt": 15,
+  "endian": ">"
+}
