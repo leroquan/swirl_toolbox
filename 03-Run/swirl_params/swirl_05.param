@@ -1,0 +1,17 @@
+# SWIRL parameters file for the Orszag-Tang test
+
+[Criterion]
+stencils : [1,2,3,4,5]
+swirlstr_params : [0.,0.,0.]
+
+[Clustering]
+dc_param : 5.
+dc_adaptive : False
+cluster_decision : gamma
+cluster_params : [0.8,0.8,1.05]
+
+[Noise]
+# Only keep more or less circular shapes (high noise_param = high tolerance)
+noise_param : 1.5
+# Removes vortices with off-centered centers (high kink_param = high tolerance)
+kink_param : 0
