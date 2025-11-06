@@ -115,10 +115,12 @@ def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
     # Build full list of tile files
     fnames = []
     for ny in range(ntiles_y):
+        row = []
         for nx in range(ntiles_x):
             ntile = nx + ntiles_x * ny + 1
             fname = fname_base + f"{itersuf}.t{ntile:03d}.nc"
-            fnames.append(fname)
+            row.append(fname)
+        fnames.append(row)  # <-- make it 2D (list of lists)
 
     # Open all files at once
     ds = xr.open_mfdataset(
@@ -128,14 +130,10 @@ def open_mncdataset(fname_base, ntiles_y, ntiles_x, iternum=None):
             "X",
         ],  # <-- may need adjustment depending on how your dims are labeled
         combine="nested",  # combine based on position in list
-        chunks={"time": 1, "X": 100, "Y": 100},  # let user pick Dask chunking
-        engine="h5netcdf",  # faster/more robust than netCDF4
-        parallel=True,  # allows concurrent file opening
+        chunks={"time": 1, "Z": -1, "Zl": -1},  # let user pick Dask chunking
+        engine="netcdf4",
+        parallel=False,
     )
-
-    # Apply your fixes
-    ds, _ = fix_dimension(ds, "Xp1", "X")
-    ds, _ = fix_dimension(ds, "Yp1", "Y")
 
     return ds
 
@@ -184,7 +182,7 @@ def _ensure_native_endian(mitgcm_ds):
 
 
 def load_input_data_netcdf(
-    mitgcm_nc_results_path, output_folder, output_grid_folder_name, px, py, endian=">"
+    mitgcm_nc_results_path, grid_folder_path, px, py, endian=">"
 ):
     ds_mitgcm = open_mncdataset(os.path.join(mitgcm_nc_results_path, "3Dsnaps"), py, px)
     ds_mitgcm = _standardize_dims(ds_mitgcm, kind="netcdf").chunk(
@@ -193,9 +191,7 @@ def load_input_data_netcdf(
     if endian == ">":
         ds_mitgcm = _ensure_native_endian(ds_mitgcm)
 
-    ds_grid = xr.open_dataset(
-        str(os.path.join(output_folder, output_grid_folder_name, "merged_grid.nc"))
-    )
+    ds_grid = xr.open_dataset(grid_folder_path)
 
     times = ds_mitgcm["time"].values
     depths = ds_grid["Z"].values
@@ -225,7 +221,7 @@ def load_input_data_binary(
     )
 
     ds_mitgcm = _standardize_dims(ds_mitgcm, kind="binary").chunk(
-        {"time": 1, "Z": -1, "Zl": -1}
+        {"time": 1, "Z": 10, "Zl": 10}
     )
     if endian == ">":
         ds_mitgcm = _ensure_native_endian(ds_mitgcm)
