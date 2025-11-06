@@ -244,7 +244,7 @@ def get_available_memory(verbose=False):
         memory_bytes = psutil.virtual_memory().available
         if verbose:
             print(
-                f"No SLURM detected. Using available system memory: {memory_bytes / 1e9:.1f} GB"
+                f"No SLURM memory allocation detected. Using available system memory: {memory_bytes / 1e9:.1f} GB"
             )
         return memory_bytes
 
@@ -914,7 +914,7 @@ def main(config_path="config_postprocessing.json"):
         print(f"Loading input data... ({get_str_current_time()})")
         if pp_config["mitgcm_output_format"] == "netcdf":
             grid_nc_path = os.path.join(
-                pp_config["output_folder"], O_GRID_FOLDER_NAME, "merged_grid.nc"
+                pp_config["grid_folder"], "merged_grid.nc"
             )
             swirl_input_data = load_input_data_netcdf(
                 pp_config["i_mitgcm_folder_path"],
@@ -960,7 +960,6 @@ def main(config_path="config_postprocessing.json"):
             save_to_netcdf(ds_reformat, output_path)
 
         # ---------------------------------
-        print(f"Loading data into RAM... ({get_str_current_time()})")
         ds = swirl_input_data.ds_mitgcm
 
         print(f"Computing lake characteristics... ({get_str_current_time()})")
@@ -1056,10 +1055,10 @@ def main(config_path="config_postprocessing.json"):
         print(f"Saving lake characteristics... ({get_str_current_time()})")
         lvl0_out_dir = os.path.join(pp_config["output_folder"], O_LVL0_FOLDER_NAME)
         os.makedirs(lvl0_out_dir, exist_ok=True)
-        output_path = os.path.join(
+        lake_csv_output_path = os.path.join(
             lvl0_out_dir, f"lake_characteristics_{start_date_str}_{end_date_str}.csv"
         )
-        pd.DataFrame(ke_lake).to_csv(output_path, index=False)
+        pd.DataFrame(ke_lake).to_csv(lake_csv_output_path, index=False)
 
         print(f"Preparing parallel tasks... ({get_str_current_time()})")
 
@@ -1084,60 +1083,46 @@ def main(config_path="config_postprocessing.json"):
         # ---------------------------------
         print(f"Computing parallel tasks... ({get_str_current_time()})")
 
-        # Submit ALL tasks at once (Dask won't load data until workers are ready)
+        from dask.distributed import as_completed
+        from tqdm import tqdm
+
+        max_in_flight = nb_cores
+        task_iter = iter(task_dict.items())
         futures_to_keys = {}
-        for key, task in task_dict.items():
-            future = client.compute(task)
-            futures_to_keys[future] = key
 
-        total_tasks = len(futures_to_keys)
-        print(f"Submitted all {total_tasks} tasks. Processing...")
+        # Start initial batch
+        for _ in range(max_in_flight):
+            try:
+                key, task = next(task_iter)
+                fut = client.compute(task)
+                futures_to_keys[fut] = key
+            except StopIteration:
+                break
 
-        # Process results as they complete
         results = {}
-        completed_count = 0
+        pbar = tqdm(total=len(task_dict))
 
-        try:
-            for future in as_completed(futures_to_keys.keys()):
-                key = futures_to_keys[future]
-
+        while futures_to_keys:
+            # as_completed over current futures
+            for fut in as_completed(futures_to_keys):
+                key = futures_to_keys.pop(fut)
                 try:
-                    result = future.result()
-                    results[key] = result
-                    completed_count += 1
-
-                    if completed_count % 10 == 0 or completed_count == total_tasks:
-                        print(f"  Completed {completed_count}/{total_tasks} tasks")
-
+                    results[key] = fut.result()
                 except Exception as e:
-                    print(f"  ERROR in task {key}: {e}")
-                    traceback.print_exc()
-                    # Continue processing other tasks or raise depending on your needs
-                    raise  # Uncomment to stop on first error
+                    results[key] = e
+                pbar.update(1)
 
-                # Clean up completed future
-                del futures_to_keys[future]
-        except KeyboardInterrupt:
-            print("\nInterrupted by user. Cancelling remaining tasks...")
-            raise
+                # Submit the next task if available
+                try:
+                    key, task = next(task_iter)
+                    new_fut = client.compute(task)
+                    futures_to_keys[new_fut] = key
+                except StopIteration:
+                    pass
 
-        except Exception as e:
-            print(f"\nError during task processing: {e}")
-            traceback.print_exc()
-            raise
+        pbar.close()
 
-        finally:
-            # Cancel any remaining futures
-            if futures_to_keys:
-                print(f"Cancelling {len(futures_to_keys)} remaining tasks...")
-                for future in list(futures_to_keys.keys()):
-                    future.cancel()
-                futures_to_keys.clear()
-
-        # ---------------------------------
-        print(
-            f"Finished all tasks. Concatenating and saving to csv... ({get_str_current_time()})"
-        )
+        print(f"Finished all tasks. Concatenating and saving to csv... ({get_str_current_time()})")
 
         if not results:
             raise ValueError("No results were computed successfully!")
@@ -1365,4 +1350,4 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
 
     freeze_support()
-    main()
+    main('config_geneva_50m.json')
