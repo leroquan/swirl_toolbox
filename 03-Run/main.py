@@ -9,6 +9,8 @@ Notes:
 
 import os
 import sys
+import glob
+import re
 import time
 from datetime import datetime
 import ctypes
@@ -24,6 +26,7 @@ import numpy as np
 
 import dask
 from dask.distributed import Client, LocalCluster, as_completed
+from tqdm import tqdm
 
 import matplotlib
 
@@ -123,7 +126,7 @@ def run_parallel_task(
         eddy_rows.append(row_data)
 
     # Optional map output for first depth
-    if d_index == -1:
+    if d_index == 0:
         if verbose:
             print(f"Map t={t_index}, d={d_index}")
         fig = plot_map_swirl(u.T, v.T, eddies, date, 6)
@@ -135,7 +138,6 @@ def run_parallel_task(
 
         # More aggressive cleanup
         plt.close("all")  # Close all figures
-        gc.collect()  # Force garbage collection
 
     del u, v, w, theta, ke_grid
     gc.collect()  # Force garbage collection
@@ -188,10 +190,10 @@ def get_number_of_cores(pp_config):
 
     else:
         # Fall back to config file
-        nb_cores = int(pp_config.get("px", 1)) * int(pp_config.get("py", 1))
+        nb_cores = int(pp_config.get("cores", 1))
         if verbose:
             print(
-                f"No SLURM detected. Using config file: px={pp_config.get('px', 1)} × py={pp_config.get('py', 1)} = {nb_cores} cores"
+                f"No SLURM detected. Using config file: = {nb_cores} cores"
             )
         return nb_cores
 
@@ -453,7 +455,7 @@ def setup_dask_client_slurm(nb_cores, memory_per_worker="auto", verbose=False):
     Parameters:
     -----------
     nb_cores : int
-        Number of workers (typically from SLURM_CPUS_PER_TASK or px*py)
+        Number of workers (typically from SLURM_CPUS_PER_TASK or pp_config["cores"])
     memory_per_worker : str or int
         Memory limit per worker. If 'auto', divides SLURM allocation by nb_cores
     """
@@ -894,6 +896,492 @@ def create_chunked_tasks(
     return task_dict
 
 
+def compute_lake_characteristics(swirl_input_data, ds, nb_cores):
+    # Process lake characteristics in batches to control memory
+    n_times = len(swirl_input_data.times)
+    n_depths = len(swirl_input_data.depths)
+    batch_size_time = estimate_batch_size(
+        swirl_input_data.ds_mitgcm,
+        n_times,
+        n_depths,
+        nb_cores=nb_cores,
+        safety_factor=0.3,
+        account_for_overhead=True,
+        target_tasks_multiplier=1,
+    )
+
+    # Create delayed tasks for batches
+    lake_tasks = []
+
+    for t_start in range(0, n_times, batch_size_time):
+        t_end = min(t_start + batch_size_time, n_times)
+
+        @dask.delayed
+        def compute_lake_batch(t_start=t_start, t_end=t_end):
+            """Process a batch of time steps"""
+            batch_results = []
+
+            # Load entire batch at once (efficient!)
+            uvel_batch = ds.UVEL.isel(time=slice(t_start, t_end)).values
+            vvel_batch = ds.VVEL.isel(time=slice(t_start, t_end)).values
+            wvel_batch = ds.WVEL.isel(time=slice(t_start, t_end)).values
+            theta_batch = ds.THETA.isel(time=slice(t_start, t_end)).values
+
+            # Process each (time, depth) in the batch
+            for ti_batch, ti_global in enumerate(range(t_start, t_end)):
+                date = pd.to_datetime(
+                    swirl_input_data.times[ti_global]
+                ).to_pydatetime()
+                for di, depth_val in enumerate(swirl_input_data.depths):
+                    u = uvel_batch[ti_batch, di].T
+                    v = vvel_batch[ti_batch, di].T
+                    w = wvel_batch[ti_batch, di].T
+                    theta = theta_batch[ti_batch, di].T
+
+                    ke_slice = compute_ke_snapshot(
+                        u,
+                        v,
+                        w,
+                        swirl_input_data.dx,
+                        swirl_input_data.dy,
+                        dz=swirl_input_data.dz_array[di],
+                    ).sum()
+                    mean_temperature = theta[theta > 0].mean()
+                    surface = (
+                            len(theta[theta > 0])
+                            * swirl_input_data.dx
+                            * swirl_input_data.dy
+                    )
+                    volume = surface * swirl_input_data.dz_array[di]
+
+                    batch_results.append(
+                        {
+                            "time_index": ti_global,
+                            "depth_index": di,
+                            "date": date,
+                            "depth_[m]": depth_val,
+                            "surface_area_[m2]": surface,
+                            "volume_slice_[m3]": volume,
+                            "kinetic_energy_[MJ]": ke_slice,
+                            "mean_temperature_lake_[°C]": mean_temperature,
+                        }
+                    )
+
+            # CRITICAL: Delete large arrays before returning
+            del uvel_batch, vvel_batch, wvel_batch, theta_batch
+            gc.collect()
+
+            return batch_results
+
+        lake_tasks.append(compute_lake_batch())
+
+    print(f"  Created {len(lake_tasks)} lake characteristic tasks")
+    print(f"  Computing in parallel...")
+
+    # Compute all batches in parallel
+    lake_results = dask.compute(*lake_tasks)
+
+    # Flatten list of lists into single list
+    ke_lake = [item for batch in lake_results for item in batch]
+
+    return ke_lake
+
+
+def print_run_statistics(results, pp_config, total_start_time):
+    # Extract timing information (one measurement per TASK)
+    task_load_times = []
+    task_compute_times = []
+    task_total_times = []
+    pixels_per_task = []
+    empty_results = 0
+
+    for result_df in results:
+        # Check if DataFrame is empty
+        if result_df.empty:
+            empty_results += 1
+            continue
+
+        # Each result is a DataFrame, extract timing from first row (should be same for all rows in the DataFrame)
+        # Check if timing columns exist and extract TASK timing
+        if (
+            "task_load_time_sec" in result_df.columns
+            and "task_compute_time_sec" in result_df.columns
+        ):
+            load_time = result_df["task_load_time_sec"].iloc[
+                0
+            ]  # Same for all rows in this task
+            compute_time = result_df["task_compute_time_sec"].iloc[0]
+            total_time = result_df["task_total_time_sec"].iloc[0]
+            n_pixels = (
+                result_df["pixels_in_task"].iloc[0]
+                if "pixels_in_task" in result_df.columns
+                else len(result_df)
+            )
+
+            task_load_times.append(load_time)
+            task_compute_times.append(compute_time)
+            task_total_times.append(total_time)
+            pixels_per_task.append(n_pixels)
+
+    # Report any issues
+    if empty_results > 0:
+        print(f"⚠️  Warning: {empty_results} tasks returned empty results")
+
+    # Calculate statistics
+    if task_total_times:
+        avg_load = np.mean(task_load_times)
+        avg_compute = np.mean(task_compute_times)
+        avg_total = np.mean(task_total_times)
+
+        min_load = np.min(task_load_times)
+        max_load = np.max(task_load_times)
+
+        min_compute = np.min(task_compute_times)
+        max_compute = np.max(task_compute_times)
+
+        min_total = np.min(task_total_times)
+        max_total = np.max(task_total_times)
+
+        std_total = np.std(task_total_times)
+
+        avg_pixels = np.mean(pixels_per_task)
+        total_pixels = sum(pixels_per_task)
+
+        # Calculate overhead percentage
+        overhead_pct = (avg_load / avg_total) * 100 if avg_total > 0 else 0
+
+        # Calculate per-pixel timing
+        avg_time_per_pixel = avg_total / avg_pixels if avg_pixels > 0 else 0
+        avg_load_per_pixel = avg_load / avg_pixels if avg_pixels > 0 else 0
+        avg_compute_per_pixel = avg_compute / avg_pixels if avg_pixels > 0 else 0
+
+        print("\n" + "=" * 60)
+        print("TASK TIMING ANALYSIS")
+        print("=" * 60)
+        print(f"Total tasks:           {len(results)}")
+        print(f"Tasks with timing:     {len(task_total_times)}")
+        print(f"Total pixels:          {total_pixels}")
+        print(f"Avg pixels per task:   {avg_pixels:.1f}")
+
+        print(f"\nTask Duration (per task - entire chunk):")
+        print(f"  Data Loading:")
+        print(f"    Average: {avg_load:.2f} sec")
+        print(f"    Min:     {min_load:.2f} sec")
+        print(f"    Max:     {max_load:.2f} sec")
+        print(f"  Computation:")
+        print(f"    Average: {avg_compute:.2f} sec")
+        print(f"    Min:     {min_compute:.2f} sec")
+        print(f"    Max:     {max_compute:.2f} sec")
+        print(f"  Total:")
+        print(f"    Average: {avg_total:.2f} sec")
+        print(f"    Min:     {min_total:.2f} sec")
+        print(f"    Max:     {max_total:.2f} sec")
+        print(f"    Std Dev: {std_total:.2f} sec")
+
+        print(f"\nPer-Pixel Performance:")
+        print(f"  Loading:     {avg_load_per_pixel:.3f} sec/pixel")
+        print(f"  Computation: {avg_compute_per_pixel:.3f} sec/pixel")
+        print(f"  Total:       {avg_time_per_pixel:.3f} sec/pixel")
+
+        print(f"\nOverhead Analysis:")
+        print(f"  Data loading overhead: {overhead_pct:.1f}% of total task time")
+
+        # Load balancing analysis
+        if max_total > 0:
+            load_imbalance = (max_total - min_total) / max_total * 100
+            print(f"\nLoad Balancing:")
+            print(f"  Variation: {load_imbalance:.1f}% (min to max)")
+            if load_imbalance > 50:
+                print(f"     HIGH variation - some tasks much slower than others")
+
+        # Recommendation
+        print(f"\n{'RECOMMENDATION':^60}")
+        print("-" * 60)
+
+        # Task duration recommendations
+        if avg_total < 5:
+            print("   Tasks are VERY SHORT (< 5 sec)")
+            print("   → Increase chunking to make tasks longer")
+            print("   → Suggested: Multiply current chunk sizes by 2-3x")
+        elif avg_total < 15:
+            print("   Tasks are SHORT (5-15 sec)")
+            print("   → Consider increasing chunk sizes slightly")
+            print("   → Suggested: Multiply current chunk sizes by 1.5-2x")
+        elif avg_total < 60:
+            print("   Tasks are GOOD (15-60 sec)")
+            print("   → Current chunking is well-balanced")
+        else:
+            print("   Tasks are LONG (> 60 sec)")
+            print("   → Consider reducing chunk sizes for better load balancing")
+            print("   → Suggested: Divide current chunk sizes by 1.5-2x")
+
+        # Overhead recommendations
+        if overhead_pct > 30:
+            print(f"\n   HIGH DATA LOADING OVERHEAD: {overhead_pct:.1f}% of time!")
+            print("   → Increasing chunk sizes will reduce relative overhead")
+        elif overhead_pct > 15:
+            print(
+                f"\n   MODERATE overhead: {overhead_pct:.1f}% spent on data loading"
+            )
+            print("   → Chunking is helping, but could be improved")
+        else:
+            print(
+                f"\n✓  LOW overhead: Only {overhead_pct:.1f}% spent on data loading"
+            )
+
+        # Load balancing recommendations
+        if load_imbalance > 50 and len(task_total_times) < 50:
+            print(f"\n   High load imbalance with few tasks!")
+            print("   → Decrease chunk sizes to create more tasks")
+            print("   → This improves load balancing across workers")
+
+        # Efficiency note
+        total_computation_time = sum(task_total_times)
+        n_workers = pp_config.get("cores", 1)
+        ideal_parallel_time = total_computation_time / n_workers
+        print(f"\nEfficiency Estimate:")
+        print(f"  Total computation: {total_computation_time:.1f} sec")
+        print(
+            f"  Ideal parallel time (perfect efficiency): {ideal_parallel_time:.1f} sec"
+        )
+        print(f"  With {n_workers} workers")
+
+        print("=" * 60 + "\n")
+    else:
+        print("   No timing information found in results")
+        print("   Make sure timing is properly added in create_chunked_tasks()")
+
+    # Print total execution time
+    total_elapsed = time.time() - total_start_time
+    hours = int(total_elapsed // 3600)
+    minutes = int((total_elapsed % 3600) // 60)
+    seconds = total_elapsed % 60
+
+    print("\n" + "=" * 60)
+    print(f"TOTAL EXECUTION TIME: {hours:02d}:{minutes:02d}:{seconds:05.2f}")
+    print(f"  ({total_elapsed:.2f} seconds)")
+    print("=" * 60)
+
+
+def compute_swirl_parallel_task(nb_cores, task_dict, client):
+    max_in_flight = nb_cores
+    task_iter = iter(task_dict.items())
+    futures_to_keys = {}
+
+    # Start initial batch
+    for _ in range(max_in_flight):
+        try:
+            key, task = next(task_iter)
+            fut = client.compute(task)
+            futures_to_keys[fut] = key
+        except StopIteration:
+            break
+
+    results = {}
+    pbar = tqdm(total=len(task_dict))
+
+    while futures_to_keys:
+        # as_completed over current futures
+        for fut in as_completed(futures_to_keys):
+            key = futures_to_keys.pop(fut)
+            try:
+                results[key] = fut.result()
+            except Exception as e:
+                results[key] = e
+            pbar.update(1)
+
+            # Submit the next task if available
+            try:
+                key, task = next(task_iter)
+                new_fut = client.compute(task)
+                futures_to_keys[new_fut] = key
+            except StopIteration:
+                pass
+
+    pbar.close()
+
+    return results
+
+
+def load_input_data(pp_config, iter_number):
+    if pp_config["mitgcm_output_format"] == "netcdf":
+        grid_nc_path = os.path.join(
+            pp_config.get("grid_folder", ""), "merged_grid.nc"
+        )
+        swirl_input_data = load_input_data_netcdf(
+            pp_config.get("i_mitgcm_folder_path", ""),
+            grid_nc_path,
+            pp_config.get("nc_px", 1),
+            pp_config.get("nc_py", 1),
+            idx_z_cut=pp_config.get("idx_z_cut", None)
+        )
+    elif pp_config["mitgcm_output_format"] == "binary":
+        print(iter_number)
+        swirl_input_data = load_input_data_binary(
+            pp_config.get("i_mitgcm_folder_path"),
+            pp_config.get("binary_mitgcm_grid_folder_path"),
+            pp_config.get("binary_ref_date"),
+            pp_config.get("binary_dt"),
+            iter_numbers=iter_number,
+            idx_z_cut=pp_config.get("idx_z_cut", None),
+        )
+    else:
+        raise ValueError(
+            f'"mitgcm_output_format" must be either "netcdf" or "binary": {pp_config["mitgcm_output_format"]}'
+        )
+
+    return swirl_input_data
+
+
+def compute_postprocessing_for_one_iteration(pp_config, iter_number, nb_cores, verbose, client, total_start_time):
+    """
+
+    :param pp_config:
+    :param iter_number:
+    :param nb_cores:
+    :param verbose:
+    :param client:
+    :param total_start_time:
+    :return: ds
+    """
+    # ---------------------------------
+    print(f"Loading input data for iteration {iter_number}... ({get_str_current_time()})")
+    swirl_input_data = load_input_data(pp_config, iter_number)
+
+    start_date_str = pd.Timestamp(swirl_input_data.times[0]).strftime("%Y%m%d")
+    end_date_str = pd.Timestamp(swirl_input_data.times[-1]).strftime("%Y%m%d")
+
+    # ---------------------------------
+    ds = swirl_input_data.ds_mitgcm
+
+    print(f"Computing lake characteristics... ({get_str_current_time()})")
+    ke_lake = compute_lake_characteristics(swirl_input_data, ds, nb_cores)
+
+    print(f"Saving lake characteristics... ({get_str_current_time()})")
+    lvl0_out_dir = os.path.join(pp_config["output_folder"], O_LVL0_FOLDER_NAME)
+    os.makedirs(lvl0_out_dir, exist_ok=True)
+    lake_csv_output_path = os.path.join(
+        lvl0_out_dir, f"lake_characteristics_{start_date_str}_{end_date_str}_{iter_number}.csv"
+    )
+    pd.DataFrame(ke_lake).to_csv(lake_csv_output_path, index=False)
+
+    print(f"Preparing parallel tasks... ({get_str_current_time()})")
+
+    # Configure chunking (add to config file or hardcode)
+    time_chunk_size = pp_config.get("time_chunk_size", 1)  # Default: no chunking
+    depth_chunk_size = pp_config.get("depth_chunk_size", 1)  # Default: no chunking
+
+    # Create chunked tasks
+    task_dict = create_chunked_tasks(
+        swirl_input_data,
+        pp_config,
+        ds,
+        nb_cores,
+        time_chunk_size=time_chunk_size,
+        depth_chunk_size=depth_chunk_size,
+        target_tasks_multiplier=pp_config.get("target_tasks_multiplier", 3.0),
+        max_n_evc_points=pp_config.get("max_n_evc_points", 30000),
+        overhead_factor=pp_config.get("overhead_factor", 1.25),
+        verbose=verbose,
+    )
+
+    # ---------------------------------
+    print(f"Computing parallel tasks... ({get_str_current_time()})")
+    results = compute_swirl_parallel_task(nb_cores, task_dict, client)
+
+    print(f"Finished all tasks. Concatenating and saving to csv... ({get_str_current_time()})")
+
+    valid_results = [
+        v for v in results.values() if isinstance(v, (pd.DataFrame, pd.Series))
+    ]
+
+    if not valid_results:
+        raise ValueError("No valid DataFrames found in results!")
+
+    df_catalogue_level0 = pd.concat(valid_results, ignore_index=True)
+
+    #df_catalogue_level0 = pd.concat(
+    #    [results[key] for key in sorted(results.keys())], ignore_index=True
+    #)
+
+    # ---------------------------------
+    # Prepare output folder + CSV
+    output_path = os.path.join(
+        lvl0_out_dir, f"lvl0_{start_date_str}_{end_date_str}_{iter_number}.csv"
+    )
+    df_catalogue_level0.to_csv(output_path, index=False)
+
+    print_run_statistics(valid_results, pp_config, total_start_time)
+
+    return ds
+
+
+def reformat_and_save_ds_to_netcdf(pp_config):
+    swirl_input_data = load_input_data(pp_config, "all")
+    print(f"Reformatting input data... ({get_str_current_time()})")
+    ds_reformat = reformat_mitgcm_results(
+        swirl_input_data.ds_mitgcm,
+        swirl_input_data.times,
+        swirl_input_data.depths,
+        pp_config["grid_folder"],
+        nodata=np.nan,
+    )
+
+    print(f"Saving merged mitgcm results... ({get_str_current_time()})")
+    mitgcm_output_folder = os.path.join(
+        pp_config["output_folder"], O_MITGCM_FOLDER_NAME
+    )
+    os.makedirs(mitgcm_output_folder, exist_ok=True)
+    start_date_str = pd.Timestamp(swirl_input_data.times[0]).strftime("%Y%m%d")
+    end_date_str = pd.Timestamp(swirl_input_data.times[-1]).strftime("%Y%m%d")
+    output_path = os.path.join(
+        mitgcm_output_folder, f"mitgcm_{start_date_str}_{end_date_str}.nc"
+    )
+    save_to_netcdf(ds_reformat, output_path)
+
+
+def get_iter_numbers_from_filename(file_name:str):
+    # Extract all numbers inside the square brackets
+    numbers = re.findall(r'(?<=\[)[0-9, ]+(?=\])', file_name)
+    nums=None
+    if numbers:
+        # Split by comma and convert each to int
+        nums = [int(n.strip()) for n in numbers[0].split(',')]
+    else:
+        print("No numbers found.")
+
+    return nums
+
+
+def read_and_concat_csv(pp_config, prefix: str):
+    out_dir = os.path.join(pp_config["output_folder"], O_LVL0_FOLDER_NAME)
+    fname_base = os.path.join(out_dir, f"{prefix}_")
+    flist = glob.glob(fname_base + "*.csv")
+    dfs = []
+    for file in flist:
+        iter_numbers = get_iter_numbers_from_filename(file)
+        if iter_numbers is None:
+            continue
+        df_temp = pd.read_csv(file)
+
+        iter_idx = 0.5 + min(iter_numbers) * pp_config["binary_dt"] / pp_config["dt_save"]
+        df_temp['time_index'] = df_temp['time_index'] + iter_idx
+
+        dfs.append(df_temp)
+
+    df_concat = pd.concat(dfs, ignore_index=True).sort_values(
+        by=['time_index', 'depth_index']).reset_index(drop=True)
+    df_concat['id'] = np.arange(len(df_concat))
+
+    start_date_str = pd.Timestamp(df_concat['date'][0]).strftime("%Y%m%d")
+    end_date_str = pd.Timestamp(df_concat['date'][len(df_concat)-1]).strftime("%Y%m%d")
+
+    output_path = os.path.join(
+        out_dir, f"{prefix}_{start_date_str}_{end_date_str}_concat.csv"
+    )
+    df_concat.to_csv(output_path, index=False)
+
+
 def main(config_path="config_postprocessing.json"):
     # Start total execution timer
     total_start_time = time.time()
@@ -910,398 +1398,32 @@ def main(config_path="config_postprocessing.json"):
     )
 
     try:
-        # ---------------------------------
-        print(f"Loading input data... ({get_str_current_time()})")
-        if pp_config["mitgcm_output_format"] == "netcdf":
-            grid_nc_path = os.path.join(
-                pp_config["grid_folder"], "merged_grid.nc"
-            )
-            swirl_input_data = load_input_data_netcdf(
-                pp_config["i_mitgcm_folder_path"],
-                grid_nc_path,
-                pp_config["px"],
-                pp_config["py"],
-            )
-        elif pp_config["mitgcm_output_format"] == "binary":
-            swirl_input_data = load_input_data_binary(
-                pp_config["i_mitgcm_folder_path"],
-                pp_config["binary_mitgcm_grid_folder_path"],
-                pp_config["binary_ref_date"],
-                pp_config["binary_dt"],
-            )
-        else:
-            raise ValueError(
-                f'"mitgcm_output_format" must be either "netcdf" or "binary": {pp_config["mitgcm_output_format"]}'
-            )
-
-        start_date_str = pd.Timestamp(swirl_input_data.times[0]).strftime("%Y%m%d")
-        end_date_str = pd.Timestamp(swirl_input_data.times[-1]).strftime("%Y%m%d")
-
         # --------------------------------
         # Optionally save merged MITgcm results (be cautious with memory)
         if pp_config.get("save_nc_mitgcm", False):
-            print(f"Reformatting input data... ({get_str_current_time()})")
-            ds_reformat = reformat_mitgcm_results(
-                swirl_input_data.ds_mitgcm,
-                swirl_input_data.times,
-                swirl_input_data.depths,
-                pp_config["grid_folder"],
-                nodata=np.nan,
-            )
+            reformat_and_save_ds_to_netcdf(pp_config)
 
-            print(f"Saving merged mitgcm results... ({get_str_current_time()})")
-            mitgcm_output_folder = os.path.join(
-                pp_config["output_folder"], O_MITGCM_FOLDER_NAME
-            )
-            os.makedirs(mitgcm_output_folder, exist_ok=True)
-            output_path = os.path.join(
-                mitgcm_output_folder, f"mitgcm_{start_date_str}_{end_date_str}.nc"
-            )
-            save_to_netcdf(ds_reformat, output_path)
-
-        # ---------------------------------
-        ds = swirl_input_data.ds_mitgcm
-
-        print(f"Computing lake characteristics... ({get_str_current_time()})")
-        ke_lake = []
-
-        # Process lake characteristics in batches to control memory
-        n_times = len(swirl_input_data.times)
-        n_depths = len(swirl_input_data.depths)
-        batch_size_time = estimate_batch_size(
-            ds,
-            n_times,
-            n_depths,
-            nb_cores=nb_cores,
-            safety_factor=0.3,
-            account_for_overhead=True,
-            target_tasks_multiplier=1,
-        )
-
-        # Create delayed tasks for batches
-        lake_tasks = []
-
-        for t_start in range(0, n_times, batch_size_time):
-            t_end = min(t_start + batch_size_time, n_times)
-
-            @dask.delayed
-            def compute_lake_batch(t_start=t_start, t_end=t_end):
-                """Process a batch of time steps"""
-                batch_results = []
-
-                # Load entire batch at once (efficient!)
-                uvel_batch = ds.UVEL.isel(time=slice(t_start, t_end)).values
-                vvel_batch = ds.VVEL.isel(time=slice(t_start, t_end)).values
-                wvel_batch = ds.WVEL.isel(time=slice(t_start, t_end)).values
-                theta_batch = ds.THETA.isel(time=slice(t_start, t_end)).values
-
-                # Process each (time, depth) in the batch
-                for ti_batch, ti_global in enumerate(range(t_start, t_end)):
-                    date = pd.to_datetime(
-                        swirl_input_data.times[ti_global]
-                    ).to_pydatetime()
-                    for di, depth_val in enumerate(swirl_input_data.depths):
-                        u = uvel_batch[ti_batch, di].T
-                        v = vvel_batch[ti_batch, di].T
-                        w = wvel_batch[ti_batch, di].T
-                        theta = theta_batch[ti_batch, di].T
-
-                        ke_slice = compute_ke_snapshot(
-                            u,
-                            v,
-                            w,
-                            swirl_input_data.dx,
-                            swirl_input_data.dy,
-                            dz=swirl_input_data.dz_array[di],
-                        ).sum()
-                        mean_temperature = theta[theta > 0].mean()
-                        surface = (
-                            len(theta[theta > 0])
-                            * swirl_input_data.dx
-                            * swirl_input_data.dy
-                        )
-                        volume = surface * swirl_input_data.dz_array[di]
-
-                        batch_results.append(
-                            {
-                                "time_index": ti_global,
-                                "depth_index": di,
-                                "date": date,
-                                "depth_[m]": depth_val,
-                                "surface_area_[m2]": surface,
-                                "volume_slice_[m3]": volume,
-                                "kinetic_energy_[MJ]": ke_slice,
-                                "mean_temperature_lake_[°C]": mean_temperature,
-                            }
-                        )
-
-                # CRITICAL: Delete large arrays before returning
-                del uvel_batch, vvel_batch, wvel_batch, theta_batch
-                gc.collect()
-
-                return batch_results
-
-            lake_tasks.append(compute_lake_batch())
-
-        print(f"  Created {len(lake_tasks)} lake characteristic tasks")
-        print(f"  Computing in parallel...")
-
-        # Compute all batches in parallel
-        lake_results = dask.compute(*lake_tasks)
-
-        # Flatten list of lists into single list
-        ke_lake = [item for batch in lake_results for item in batch]
-
-        print(f"Saving lake characteristics... ({get_str_current_time()})")
-        lvl0_out_dir = os.path.join(pp_config["output_folder"], O_LVL0_FOLDER_NAME)
-        os.makedirs(lvl0_out_dir, exist_ok=True)
-        lake_csv_output_path = os.path.join(
-            lvl0_out_dir, f"lake_characteristics_{start_date_str}_{end_date_str}.csv"
-        )
-        pd.DataFrame(ke_lake).to_csv(lake_csv_output_path, index=False)
-
-        print(f"Preparing parallel tasks... ({get_str_current_time()})")
-
-        # Configure chunking (add to config file or hardcode)
-        time_chunk_size = pp_config.get("time_chunk_size", 1)  # Default: no chunking
-        depth_chunk_size = pp_config.get("depth_chunk_size", 1)  # Default: no chunking
-
-        # Create chunked tasks
-        task_dict = create_chunked_tasks(
-            swirl_input_data,
-            pp_config,
-            ds,
-            nb_cores,
-            time_chunk_size=time_chunk_size,
-            depth_chunk_size=depth_chunk_size,
-            target_tasks_multiplier=pp_config.get("target_tasks_multiplier", 3.0),
-            max_n_evc_points=pp_config.get("max_n_evc_points", 30000),
-            overhead_factor=pp_config.get("overhead_factor", 1.25),
-            verbose=verbose,
-        )
-
-        # ---------------------------------
-        print(f"Computing parallel tasks... ({get_str_current_time()})")
-
-        from dask.distributed import as_completed
-        from tqdm import tqdm
-
-        max_in_flight = nb_cores
-        task_iter = iter(task_dict.items())
-        futures_to_keys = {}
-
-        # Start initial batch
-        for _ in range(max_in_flight):
-            try:
-                key, task = next(task_iter)
-                fut = client.compute(task)
-                futures_to_keys[fut] = key
-            except StopIteration:
-                break
-
-        results = {}
-        pbar = tqdm(total=len(task_dict))
-
-        while futures_to_keys:
-            # as_completed over current futures
-            for fut in as_completed(futures_to_keys):
-                key = futures_to_keys.pop(fut)
-                try:
-                    results[key] = fut.result()
-                except Exception as e:
-                    results[key] = e
-                pbar.update(1)
-
-                # Submit the next task if available
-                try:
-                    key, task = next(task_iter)
-                    new_fut = client.compute(task)
-                    futures_to_keys[new_fut] = key
-                except StopIteration:
-                    pass
-
-        pbar.close()
-
-        print(f"Finished all tasks. Concatenating and saving to csv... ({get_str_current_time()})")
-
-        if not results:
-            raise ValueError("No results were computed successfully!")
-
-        # Extract timing information (one measurement per TASK)
-        task_load_times = []
-        task_compute_times = []
-        task_total_times = []
-        pixels_per_task = []
-        empty_results = 0
-
-        for key, result_df in results.items():
-            # Check if DataFrame is empty
-            if result_df.empty:
-                empty_results += 1
-                continue
-
-            # Each result is a DataFrame, extract timing from first row (should be same for all rows in the DataFrame)
-            # Check if timing columns exist and extract TASK timing
-            if (
-                "task_load_time_sec" in result_df.columns
-                and "task_compute_time_sec" in result_df.columns
-            ):
-                load_time = result_df["task_load_time_sec"].iloc[
-                    0
-                ]  # Same for all rows in this task
-                compute_time = result_df["task_compute_time_sec"].iloc[0]
-                total_time = result_df["task_total_time_sec"].iloc[0]
-                n_pixels = (
-                    result_df["pixels_in_task"].iloc[0]
-                    if "pixels_in_task" in result_df.columns
-                    else len(result_df)
-                )
-
-                task_load_times.append(load_time)
-                task_compute_times.append(compute_time)
-                task_total_times.append(total_time)
-                pixels_per_task.append(n_pixels)
-
-        # Report any issues
-        if empty_results > 0:
-            print(f"⚠️  Warning: {empty_results} tasks returned empty results")
-
-        # Calculate statistics
-        if task_total_times:
-            avg_load = np.mean(task_load_times)
-            avg_compute = np.mean(task_compute_times)
-            avg_total = np.mean(task_total_times)
-
-            min_load = np.min(task_load_times)
-            max_load = np.max(task_load_times)
-
-            min_compute = np.min(task_compute_times)
-            max_compute = np.max(task_compute_times)
-
-            min_total = np.min(task_total_times)
-            max_total = np.max(task_total_times)
-
-            std_total = np.std(task_total_times)
-
-            avg_pixels = np.mean(pixels_per_task)
-            total_pixels = sum(pixels_per_task)
-
-            # Calculate overhead percentage
-            overhead_pct = (avg_load / avg_total) * 100 if avg_total > 0 else 0
-
-            # Calculate per-pixel timing
-            avg_time_per_pixel = avg_total / avg_pixels if avg_pixels > 0 else 0
-            avg_load_per_pixel = avg_load / avg_pixels if avg_pixels > 0 else 0
-            avg_compute_per_pixel = avg_compute / avg_pixels if avg_pixels > 0 else 0
-
-            print("\n" + "=" * 60)
-            print("TASK TIMING ANALYSIS")
-            print("=" * 60)
-            print(f"Total tasks:           {len(results)}")
-            print(f"Tasks with timing:     {len(task_total_times)}")
-            print(f"Total pixels:          {total_pixels}")
-            print(f"Avg pixels per task:   {avg_pixels:.1f}")
-
-            print(f"\nTask Duration (per task - entire chunk):")
-            print(f"  Data Loading:")
-            print(f"    Average: {avg_load:.2f} sec")
-            print(f"    Min:     {min_load:.2f} sec")
-            print(f"    Max:     {max_load:.2f} sec")
-            print(f"  Computation:")
-            print(f"    Average: {avg_compute:.2f} sec")
-            print(f"    Min:     {min_compute:.2f} sec")
-            print(f"    Max:     {max_compute:.2f} sec")
-            print(f"  Total:")
-            print(f"    Average: {avg_total:.2f} sec")
-            print(f"    Min:     {min_total:.2f} sec")
-            print(f"    Max:     {max_total:.2f} sec")
-            print(f"    Std Dev: {std_total:.2f} sec")
-
-            print(f"\nPer-Pixel Performance:")
-            print(f"  Loading:     {avg_load_per_pixel:.3f} sec/pixel")
-            print(f"  Computation: {avg_compute_per_pixel:.3f} sec/pixel")
-            print(f"  Total:       {avg_time_per_pixel:.3f} sec/pixel")
-
-            print(f"\nOverhead Analysis:")
-            print(f"  Data loading overhead: {overhead_pct:.1f}% of total task time")
-
-            # Load balancing analysis
-            if max_total > 0:
-                load_imbalance = (max_total - min_total) / max_total * 100
-                print(f"\nLoad Balancing:")
-                print(f"  Variation: {load_imbalance:.1f}% (min to max)")
-                if load_imbalance > 50:
-                    print(f"     HIGH variation - some tasks much slower than others")
-
-            # Recommendation
-            print(f"\n{'RECOMMENDATION':^60}")
-            print("-" * 60)
-
-            # Task duration recommendations
-            if avg_total < 5:
-                print("   Tasks are VERY SHORT (< 5 sec)")
-                print("   → Increase chunking to make tasks longer")
-                print("   → Suggested: Multiply current chunk sizes by 2-3x")
-            elif avg_total < 15:
-                print("   Tasks are SHORT (5-15 sec)")
-                print("   → Consider increasing chunk sizes slightly")
-                print("   → Suggested: Multiply current chunk sizes by 1.5-2x")
-            elif avg_total < 60:
-                print("   Tasks are GOOD (15-60 sec)")
-                print("   → Current chunking is well-balanced")
-            else:
-                print("   Tasks are LONG (> 60 sec)")
-                print("   → Consider reducing chunk sizes for better load balancing")
-                print("   → Suggested: Divide current chunk sizes by 1.5-2x")
-
-            # Overhead recommendations
-            if overhead_pct > 30:
-                print(f"\n   HIGH DATA LOADING OVERHEAD: {overhead_pct:.1f}% of time!")
-                print("   → Increasing chunk sizes will reduce relative overhead")
-            elif overhead_pct > 15:
-                print(
-                    f"\n   MODERATE overhead: {overhead_pct:.1f}% spent on data loading"
-                )
-                print("   → Chunking is helping, but could be improved")
-            else:
-                print(
-                    f"\n✓  LOW overhead: Only {overhead_pct:.1f}% spent on data loading"
-                )
-
-            # Load balancing recommendations
-            if load_imbalance > 50 and len(task_total_times) < 50:
-                print(f"\n   High load imbalance with few tasks!")
-                print("   → Decrease chunk sizes to create more tasks")
-                print("   → This improves load balancing across workers")
-
-            # Efficiency note
-            total_computation_time = sum(task_total_times)
-            n_workers = pp_config.get("px", 1) * pp_config.get("py", 1)
-            ideal_parallel_time = total_computation_time / n_workers
-            print(f"\nEfficiency Estimate:")
-            print(f"  Total computation: {total_computation_time:.1f} sec")
-            print(
-                f"  Ideal parallel time (perfect efficiency): {ideal_parallel_time:.1f} sec"
-            )
-            print(f"  With {n_workers} workers")
-
-            print("=" * 60 + "\n")
+        if pp_config['iterations'] == "all":
+            fname_base = os.path.join(pp_config["i_mitgcm_folder_path"], "3Dsnaps")
+            flist = glob.glob(fname_base + "*.data")
+            flist = [os.path.basename(f) for f in flist]
+            if flist == []:
+                raise ValueError(f"No files were found with path {fname_base + '*.data'}")
+            iters = np.sort([int(file_name.split('.')[1]) for file_name in flist])
         else:
-            print("   No timing information found in results")
-            print("   Make sure timing is properly added in create_chunked_tasks()")
+            iters = pp_config['iterations']
 
-        # Continue with concatenation
-        print(f"Concatenating and saving to csv... ({get_str_current_time()})")
-        df_catalogue_level0 = pd.concat(
-            [results[key] for key in sorted(results.keys())], ignore_index=True
-        )
+        print(f"iterations: ")
+        print(iters)
+        for i in range(0, len(iters), pp_config.get("time_chunk_size", 1)):
+            iter_numbers = iters[i : i + pp_config.get("time_chunk_size", 1)]
+            ds = compute_postprocessing_for_one_iteration(pp_config, list(iter_numbers), nb_cores, verbose, client, total_start_time)
+            client.run(gc.collect)
 
         # ---------------------------------
-        # Prepare output folder + CSV
-        output_path = os.path.join(
-            lvl0_out_dir, f"lvl0_{start_date_str}_{end_date_str}.csv"
-        )
-        df_catalogue_level0.to_csv(output_path, index=False)
+        print(f"Finished all iterations. Concatenating and saving to final csv...")
+        read_and_concat_csv(pp_config, "lvl0")
+        read_and_concat_csv(pp_config, "lake_characteristics")
 
         # ---------------------------------
         print(f"Checking if MITgcm diverged... ({get_str_current_time()})")
@@ -1313,17 +1435,6 @@ def main(config_path="config_postprocessing.json"):
 
         # ---------------------------------
         print(f"Done. ({get_str_current_time()})")
-
-        # Print total execution time
-        total_elapsed = time.time() - total_start_time
-        hours = int(total_elapsed // 3600)
-        minutes = int((total_elapsed % 3600) // 60)
-        seconds = total_elapsed % 60
-
-        print("\n" + "=" * 60)
-        print(f"TOTAL EXECUTION TIME: {hours:02d}:{minutes:02d}:{seconds:05.2f}")
-        print(f"  ({total_elapsed:.2f} seconds)")
-        print("=" * 60)
 
     except Exception as e:
         # Calculate elapsed time even on error
