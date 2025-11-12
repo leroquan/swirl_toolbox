@@ -182,7 +182,7 @@ def _ensure_native_endian(mitgcm_ds):
 
 
 def load_input_data_netcdf(
-    mitgcm_nc_results_path, grid_folder_path, px, py, endian=">"
+    mitgcm_nc_results_path, grid_folder_path, px, py, endian=">", idx_z_cut=None
 ):
     ds_mitgcm = open_mncdataset(os.path.join(mitgcm_nc_results_path, "3Dsnaps"), py, px)
     ds_mitgcm = _standardize_dims(ds_mitgcm, kind="netcdf").chunk(
@@ -190,6 +190,9 @@ def load_input_data_netcdf(
     )
     if endian == ">":
         ds_mitgcm = _ensure_native_endian(ds_mitgcm)
+
+    if idx_z_cut is not None:
+        ds_mitgcm = ds_mitgcm.isel(Z=range(idx_z_cut), Zl=range(idx_z_cut), Zp1=range(idx_z_cut), Zu=range(idx_z_cut))
 
     ds_grid = xr.open_dataset(grid_folder_path)
 
@@ -208,22 +211,28 @@ def load_input_data_binary(
     binary_mitgcm_grid_folder_path,
     ref_date,
     dt_mitgcm_results,
-    endian=">",
+    iter_numbers="all",
+    idx_z_cut=None
 ):
+    endian_type = ">"
     ds_mitgcm = xm.open_mdsdataset(
         mitgcm_bin_results_path,
         grid_dir=binary_mitgcm_grid_folder_path,
         ref_date=ref_date,
         prefix="3Dsnaps",
         delta_t=dt_mitgcm_results,
-        endian=endian,
-        iters="all",
+        endian=endian_type,
+        iters=iter_numbers,
     )
 
     ds_mitgcm = _standardize_dims(ds_mitgcm, kind="binary").chunk(
         {"time": 1, "Z": 10, "Zl": 10}
     )
-    if endian == ">":
+
+    if idx_z_cut is not None:
+        ds_mitgcm = ds_mitgcm.isel(Z=range(idx_z_cut), Zl=range(idx_z_cut), Zp1=range(idx_z_cut), Zu=range(idx_z_cut))
+
+    if endian_type == ">":
         ds_mitgcm = _ensure_native_endian(ds_mitgcm)
 
     times = ds_mitgcm["time"].values
