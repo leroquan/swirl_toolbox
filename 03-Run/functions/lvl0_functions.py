@@ -11,13 +11,8 @@ def translate_rotation_direction(eddy_orientation: int):
 # Helper function to extract eddy info into a row
 def extract_eddy_data(indices_eddy, eddy, date, depth, dz, ke_grid_megajoules, surface_cell, theta, id_level0=0):
     vortex_indices = tuple(eddy.vortex_cells.astype(int))
-
-    ke_lake = ke_grid_megajoules.sum()
     ke_eddy = ke_grid_megajoules[vortex_indices[0], vortex_indices[1]].sum()
-
     mean_temperature_eddy = theta[vortex_indices[0], vortex_indices[1]].mean()
-    mean_temperature_lake = theta[theta > 0].mean()
-
     surface_area = len(eddy.vortex_cells[0]) * surface_cell
 
     return {
@@ -33,9 +28,7 @@ def extract_eddy_data(indices_eddy, eddy, date, depth, dz, ke_grid_megajoules, s
         'volume_slice_[m3]': float(surface_area * dz),
         'rotation_direction': translate_rotation_direction(eddy.orientation),
         'kinetic_energy_eddy_[MJ]': float(ke_eddy),
-        'kinetic_energy_lake_[MJ]': float(ke_lake),
         'mean_temperature_eddy_[°C]': mean_temperature_eddy,
-        'mean_temperature_lake_[°C]': mean_temperature_lake,
         # convert arrays to comma-separated strings so CSV keeps all values
         'i_eddy_cells': ",".join(map(str, eddy.vortex_cells[0])),
         'j_eddy_cells': ",".join(map(str, eddy.vortex_cells[1]))

@@ -33,15 +33,14 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend, better for saving files
 import matplotlib.pyplot as plt
 
-from functions import run_swirl, plot_map_swirl
-from functions import load_input_data_netcdf, load_input_data_binary
-from functions import reformat_mitgcm_results
-from functions import compute_ke_snapshot, extract_eddy_data
-from functions import save_to_netcdf
+from functions import *
 
 O_MITGCM_FOLDER_NAME = "mitgcm_results"
 O_GRID_FOLDER_NAME = "grid"
 O_LVL0_FOLDER_NAME = "eddy_catalogues_lvl0"
+O_FIGURE_FOLDER_NAME = "figures"
+
+DEFAULT_CONFIG_NAME = "config_lucerne.json"
 
 
 def can_use_malloc_trim():
@@ -51,7 +50,7 @@ def can_use_malloc_trim():
 
 
 # Use malloc_trim to aggressively return freed memory (with the GNU allocator only)
-HAS_MALLOC_TRIM = False  # can_use_malloc_trim()
+HAS_MALLOC_TRIM = can_use_malloc_trim()
 print(f"malloc_trim available: {HAS_MALLOC_TRIM}")
 
 
@@ -59,69 +58,44 @@ def get_str_current_time():
     return datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def run_parallel_task(
-    u,
-    v,
-    w,
-    theta,
-    dx,
-    dy,
-    dz,
-    swirl_params_path,
-    date,
-    depth,
-    t_index,
-    d_index,
-    output_folder,
-    max_n_evc_points=30000,
-    overhead_factor=1.25,
-    id_level0=0,
-    verbose=False,
+def compute_eddy_catalogue(
+        u, v, theta,
+        ke_slice,
+        dx, dy, dz,
+        swirl_params_path,
+        date,  depth,
+        t_index, d_index,
+        output_folder,
+        id_level0=0,
+        verbose=False,
 ):
-    import uuid
-    import sys
-
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-    os.environ["PYTHONUNBUFFERED"] = "1"
-
     # Eddy detection & feature extraction (same as before)
     if verbose:
         print(f"Run swirl for t={t_index}, d={d_index}")
         print(f"[TASK] About to call run_swirl...", flush=True)
+
     eddies = run_swirl(
-        u,
-        v,
-        dx,
-        dy,
+        u, v,
+        dx, dy,
         swirl_params_path,
-        max_n_evc_points,
-        overhead_factor,
-        t_index,
-        d_index,
-        str(uuid.uuid4())[:8],
     )
+
     if verbose:
         print(f"[TASK] run_swirl RETURNED!", flush=True)
-    # Check using attribute, not boolean
+
     if hasattr(eddies, "n_vortices") and eddies.n_vortices == 0:
-        print(f"[TASK] No vortices found, returning empty", flush=True)
+        if verbose:
+            print(f"[TASK] No vortices found, returning empty", flush=True)
         return pd.DataFrame()
 
     if verbose:
         print(f"[TASK] Processing {eddies.n_vortices} vortices...", flush=True)
-    if not eddies:
-        return pd.DataFrame()  # empty result for this slice
 
-    # print(f'Compute KE for t={t_index}, d={d_index}')
-    ke_grid = compute_ke_snapshot(u, v, w, dx, dy, dz)
-
-    # print(f'Extract eddy data for t={t_index}, d={d_index}')
     eddy_rows = []
     for eddy_index, eddy in enumerate(eddies):
         indices_eddy = (t_index, d_index, eddy_index)
         row_data = extract_eddy_data(
-            indices_eddy, eddy, date, depth, dz, ke_grid, dx * dy, theta, id_level0
+            indices_eddy, eddy, date, depth, dz, ke_slice, dx * dy, theta, id_level0
         )
         eddy_rows.append(row_data)
 
@@ -130,16 +104,12 @@ def run_parallel_task(
         if verbose:
             print(f"Map t={t_index}, d={d_index}")
         fig = plot_map_swirl(u.T, v.T, eddies, date, 6)
-        out_fig_dir = os.path.join(output_folder, "figures")
-        os.makedirs(out_fig_dir, exist_ok=True)
-        fig_path = os.path.join(out_fig_dir, f"map_swirl_{date}.png")
+        fig_path = os.path.join(output_folder, O_FIGURE_FOLDER_NAME, f"map_swirl_{date}.png")
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)  # IMPORTANT: free matplotlib memory
-
-        # More aggressive cleanup
         plt.close("all")  # Close all figures
 
-    del u, v, w, theta, ke_grid
+    del u, v, theta, ke_slice,
     gc.collect()  # Force garbage collection
 
     # print(f'Concatenating t={t_index}, d={d_index}')
@@ -259,8 +229,6 @@ def estimate_batch_size(
     safety_factor=0.3,
     account_for_overhead=False,
     target_tasks_multiplier=3,
-    max_n_evc_points=None,
-    overhead_factor=None,
     verbose=False,
 ):
     """
@@ -284,12 +252,6 @@ def estimate_batch_size(
     target_tasks_multiplier : int
         Target number of tasks = nb_cores × this multiplier
         (e.g., 3 means aim for 3× as many tasks as workers for load balancing)
-    max_n_evc_points : int
-        Maximum number of EVC points for SWIRL clustering
-        Used to estimate worst-case SWIRL memory consumption
-    overhead_factor : float
-        Multiplicative factor for SWIRL clustering memory overhead
-        Accounts for intermediate allocations and GC behavior
     """
 
     # Get memory estimation
@@ -307,52 +269,17 @@ def estimate_batch_size(
         + sample_theta.size * n_depths * sample_theta.dtype.itemsize
     )
 
-    if max_n_evc_points is not None and overhead_factor is not None:
 
-        # Estimate SWIRL clustering memory per timestep
-        # Formula: overhead_factor × 2.0 × (N² × 8 bytes)
-        # where N = max_n_evc_points (worst case per pixel)
-        swirl_memory_per_pixel = overhead_factor * 2.0 * (max_n_evc_points**2) * 8
+    swirl_safety_buffer = 0
+    total_memory_per_timestep = memory_per_timestep
 
-        # Total SWIRL memory for one timestep (all depths)
-        swirl_memory_per_timestep = swirl_memory_per_pixel * n_depths
-
-        # Total memory per timestep including input data + SWIRL processing
-        total_memory_per_timestep = memory_per_timestep + swirl_memory_per_timestep
-
-        if verbose:
-            print(
-                f"  Data types: UVEL={sample_uvel.dtype}, VVEL={sample_vvel.dtype}, WVEL={sample_wvel.dtype}, THETA={sample_theta.dtype}"
-            )
-
-            # Print memory breakdown
-            print(f"  Memory per timestep breakdown:")
-            print(f"    Input data:        {memory_per_timestep / 1e9:.2f} GB")
-            print(f"    SWIRL (estimated): {swirl_memory_per_timestep / 1e9:.2f} GB")
-            print(
-                f"      (max {max_n_evc_points} EVC points/pixel × {n_depths} depths × {overhead_factor}× overhead)"
-            )
-            print(f"    Total per timestep: {total_memory_per_timestep / 1e9:.2f} GB")
-
-        # Peak memory = (batch_size × input_data) + (swirl_buffer for 1-2 pixels)
-        # Safety: assume 2 pixels' worth of SWIRL can coexist if GC lags
-        swirl_safety_buffer = 1.5 * swirl_memory_per_pixel
-
-    else:
-        swirl_memory_per_pixel = 0
-        swirl_safety_buffer = 0
-        total_memory_per_timestep = memory_per_timestep
-
-        if verbose:
-            print(
-                f"  Data types: UVEL={sample_uvel.dtype}, VVEL={sample_vvel.dtype}, WVEL={sample_wvel.dtype}, THETA={sample_theta.dtype}"
-            )
-            print(
-                f"  Memory per timestep (input data): {memory_per_timestep / 1e9:.2f} GB"
-            )
-            print(
-                f"  SWIRL memory estimation: DISABLED (no max_n_evc_points/overhead_factor)"
-            )
+    if verbose:
+        print(
+            f"  Data types: UVEL={sample_uvel.dtype}, VVEL={sample_vvel.dtype}, WVEL={sample_wvel.dtype}, THETA={sample_theta.dtype}"
+        )
+        print(
+            f"  Memory per timestep (input data): {memory_per_timestep / 1e9:.2f} GB"
+        )
 
     # Total memory
     total_memory = get_available_memory(verbose=verbose)
@@ -448,7 +375,7 @@ def estimate_batch_size(
     return batch_size
 
 
-def setup_dask_client_slurm(nb_cores, memory_per_worker="auto", verbose=False):
+def setup_dask_client(nb_cores, memory_per_worker="auto", verbose=False):
     """
     Setup Dask client with SLURM-aware memory limits.
 
@@ -491,20 +418,16 @@ def setup_dask_client_slurm(nb_cores, memory_per_worker="auto", verbose=False):
     return client, cluster
 
 
-def create_chunked_tasks(
-    swirl_input_data,
-    pp_config,
-    ds,
-    nb_cores,
-    time_chunk_size=2,
-    depth_chunk_size=50,
-    target_tasks_multiplier=3,
-    max_n_evc_points=30000,
-    overhead_factor=1.25,
-    verbose=False,
-):
+def get_chunk_sizes(
+        time_chunk_size, depth_chunk_size,
+        ds,
+        n_depths, n_times, nb_cores,
+        target_tasks_multiplier,
+        verbose=False):
+
     """
-    Create chunked tasks to reduce overhead.
+    Estimates the time and depth chunks sizes based on manual/auto values,
+    available memory and number of available cores.
 
     Chunking Logic:
     ===============
@@ -536,35 +459,8 @@ def create_chunked_tasks(
     - -1: Use full dimension (no chunking on that dimension)
     - positive integer: Use that specific chunk size
 
-    Parameters:
-    -----------
-    swirl_input_data : SwirlInputData
-        Input data object containing times, depths, etc.
-    pp_config : dict
-        Configuration dictionary
-    ds : xarray.Dataset
-        The dataset to chunk
-    nb_cores : int
-        Number of workers
-    time_chunk_size : int or str
-        Number of time steps per task (default: 1)
-    depth_chunk_size : int or str
-        Number of depth levels per task (default: 1)
-    target_tasks_multiplier : float
-        Target number of tasks = nb_cores × this multiplier (default: 3)
-        Use lower values (1.5) for fast tasks, higher (3-5) for slow tasks
-    max_n_evc_points : int
-        Maximum number of EVC points for SWIRL clustering
-    overhead_factor : float
-        Overhead factor for SWIRL memory estimation
-
-    Returns:
-    --------
-    dict : Dictionary of delayed tasks
+    :return: time_chunk_size, depth_chunk_size
     """
-
-    n_times = len(swirl_input_data.times)
-    n_depths = len(swirl_input_data.depths)
 
     # Store whether values are auto
     time_is_auto = time_chunk_size == "auto"
@@ -584,8 +480,6 @@ def create_chunked_tasks(
             safety_factor=0.3,
             account_for_overhead=True,
             target_tasks_multiplier=target_tasks_multiplier,
-            max_n_evc_points=30000,
-            overhead_factor=1.25,
         )
 
     # === HANDLE DEPTH CHUNKING ===
@@ -674,6 +568,52 @@ def create_chunked_tasks(
         if verbose:
             print(f"  depth_chunk_size=-1 → using full depth dimension: {n_depths}")
 
+    return time_chunk_size, depth_chunk_size
+
+
+def create_chunked_tasks(
+    swirl_input_data,
+    pp_config,
+    ds,
+    nb_cores,
+    time_chunk_size=2,
+    depth_chunk_size=50,
+    target_tasks_multiplier=3,
+    verbose=False,
+):
+    """
+    Create chunked tasks to reduce overhead.
+
+    Parameters:
+    -----------
+    swirl_input_data : SwirlInputData
+        Input data object containing times, depths, etc.
+    pp_config : dict
+        Configuration dictionary
+    ds : xarray.Dataset
+        The dataset to chunk
+    nb_cores : int
+        Number of workers
+    time_chunk_size : int or str
+        Number of time steps per task (default: 1)
+    depth_chunk_size : int or str
+        Number of depth levels per task (default: 1)
+    target_tasks_multiplier : float
+        Target number of tasks = nb_cores × this multiplier (default: 3)
+        Use lower values (1.5) for fast tasks, higher (3-5) for slow tasks
+    max_n_evc_points : int
+        Maximum number of EVC points for SWIRL clustering
+    overhead_factor : float
+        Overhead factor for SWIRL memory estimation
+
+    Returns:
+    --------
+    dict : Dictionary of delayed tasks
+    """
+
+    n_times = len(swirl_input_data.times)
+    n_depths = len(swirl_input_data.depths)
+
     # === CREATE CHUNKS ===
     # Create time chunks
     time_chunks = []
@@ -687,11 +627,11 @@ def create_chunked_tasks(
         d_end = min(d_start + depth_chunk_size, n_depths)
         depth_chunks.append((d_start, d_end))
 
-    pixels_per_task = time_chunk_size * depth_chunk_size
-    total_pixels = n_times * n_depths
-    total_tasks = len(time_chunks) * len(depth_chunks)
-
     if verbose:
+        pixels_per_task = time_chunk_size * depth_chunk_size
+        total_pixels = n_times * n_depths
+        total_tasks = len(time_chunks) * len(depth_chunks)
+
         print(f"\nTask chunking summary:")
         print(
             f"  {len(time_chunks)} time chunks × {len(depth_chunks)} depth chunks = {total_tasks} total tasks"
@@ -715,8 +655,6 @@ def create_chunked_tasks(
                 t_end=t_end,
                 d_start=d_start,
                 d_end=d_end,
-                max_n_evc_points=max_n_evc_points,
-                overhead_factor=overhead_factor,
                 verbose=verbose,
             ):
                 """Process a chunk of (time, depth) pairs"""
@@ -733,20 +671,19 @@ def create_chunked_tasks(
                 gc.collect()
                 gc.collect()
 
-                # Check what's in memory
-                all_objects = gc.get_objects()
-                large_objects = []
-                for obj in all_objects:
-                    try:
-                        size = sys.getsizeof(obj)
-                        if size > 10 * 1024 * 1024:  # > 10 MB
-                            large_objects.append((type(obj).__name__, size / 1024**2))
-                    except:
-                        pass
-
-                large_objects.sort(key=lambda x: x[1], reverse=True)
-
                 if verbose:
+                    # Check what's in memory
+                    all_objects = gc.get_objects()
+                    large_objects = []
+                    for obj in all_objects:
+                        try:
+                            size = sys.getsizeof(obj)
+                            if size > 10 * 1024 * 1024:  # > 10 MB
+                                large_objects.append((type(obj).__name__, size / 1024 ** 2))
+                        except:
+                            pass
+
+                    large_objects.sort(key=lambda x: x[1], reverse=True)
                     print(
                         f"[Task {task_id}] BEFORE loading - Large objects in memory:",
                         flush=True,
@@ -791,15 +728,14 @@ def create_chunked_tasks(
                             flush=True,
                         )
 
-                # Calculate expected memory from actual array sizes
-                expected_memory_gb = (
-                    uvel_chunk.nbytes
-                    + vvel_chunk.nbytes
-                    + wvel_chunk.nbytes
-                    + theta_chunk.nbytes
-                ) / 1e9
-
                 if verbose:
+                    # Calculate expected memory from actual array sizes
+                    expected_memory_gb = (
+                                                 uvel_chunk.nbytes
+                                                 + vvel_chunk.nbytes
+                                                 + wvel_chunk.nbytes
+                                                 + theta_chunk.nbytes
+                                         ) / 1e9
                     # print(f"[Task {task_id}] Worker {worker_id} memory AFTER loading: {mem_after_load:.2f} GB")
                     print(
                         f"[Task {task_id}] Worker {worker_id} data should be ~{expected_memory_gb:.2f} GB"
@@ -810,7 +746,8 @@ def create_chunked_tasks(
 
                 # Time computation
                 compute_start = time.time()
-                chunk_results = []
+                eddy_results = []
+                lake_results = []
 
                 for ti_idx, ti in enumerate(range(t_start, t_end)):
                     for di_idx, di in enumerate(range(d_start, d_end)):
@@ -820,32 +757,53 @@ def create_chunked_tasks(
                         wvel = wvel_chunk[ti_idx, di_idx].T
                         theta = theta_chunk[ti_idx, di_idx].T
 
-                        date = pd.to_datetime(
-                            swirl_input_data.times[ti]
-                        ).to_pydatetime()
+                        date = pd.to_datetime(swirl_input_data.times[ti]).to_pydatetime()
                         depth = float(swirl_input_data.depths[di])
                         dz = swirl_input_data.dz_array[di]
 
-                        result = run_parallel_task(
+                        # First, compute lake characteristics
+                        ke_slice = compute_ke_snapshot(
                             uvel,
                             vvel,
                             wvel,
-                            theta,
+                            swirl_input_data.dx,
+                            swirl_input_data.dy,
+                            dz=swirl_input_data.dz_array[di],
+                        )
+                        temperature_slice = theta[theta > 0]
+                        surface = (
+                                len(theta[theta > 0])
+                                * swirl_input_data.dx
+                                * swirl_input_data.dy
+                        )
+                        volume = surface * swirl_input_data.dz_array[di]
+                        lake_results.append(pd.DataFrame([{
+                                "time_index": ti,
+                                "depth_index": di,
+                                "date": date,
+                                "depth_[m]": depth,
+                                "surface_area_[m2]": surface,
+                                "volume_slice_[m3]": volume,
+                                "kinetic_energy_[MJ]": ke_slice.sum(),
+                                "mean_temperature_lake_[°C]": temperature_slice.mean(),
+                            }]))
+
+                        # Then, compute eddies
+                        eddy_catalogue = compute_eddy_catalogue(
+                            uvel, vvel, theta,
+                            ke_slice,
                             swirl_input_data.dx,
                             swirl_input_data.dy,
                             dz,
                             pp_config["swirl_params_path"],
-                            date,
-                            depth,
-                            ti,
-                            di,
+                            date, depth,
+                            ti, di,
                             pp_config["output_folder"],
-                            max_n_evc_points=max_n_evc_points,
-                            overhead_factor=overhead_factor,
                             verbose=verbose,
                         )
+                        eddy_results.append(eddy_catalogue)
 
-                        chunk_results.append(result)
+
 
                 total_compute_time = time.time() - compute_start
 
@@ -864,24 +822,18 @@ def create_chunked_tasks(
                         libc = ctypes.CDLL(libc_name)
                         libc.malloc_trim(0)
 
-                mem_after_delete = process.memory_info().rss / 1024**3
                 if verbose:
+                    mem_after_delete = process.memory_info().rss / 1024 ** 3
                     print(
                         f"[Task {task_id}] Worker {worker_id} memory AFTER delete: {mem_after_delete:.2f} GB"
                     )
 
                 # Combine results from this chunk
-                if chunk_results:
-                    combined = pd.concat(chunk_results, ignore_index=True)
-                    combined["task_load_time_sec"] = total_load_time
-                    combined["task_compute_time_sec"] = total_compute_time
-                    combined["task_total_time_sec"] = (
-                        total_load_time + total_compute_time
-                    )
-                    combined["pixels_in_task"] = len(chunk_results)
-                    return combined
-                else:
-                    return pd.DataFrame(
+                combined_lake_results = pd.DataFrame()
+                if lake_results:
+                    combined_lake_results = pd.concat(lake_results, ignore_index=True)
+
+                combined_eddy_results = pd.DataFrame(
                         columns=[
                             "task_load_time_sec",
                             "task_compute_time_sec",
@@ -889,102 +841,23 @@ def create_chunked_tasks(
                             "pixels_in_task",
                         ]
                     )
+                if eddy_results:
+                    combined_eddy_results = pd.concat(eddy_results, ignore_index=True)
+
+                    if verbose:
+                        combined_eddy_results["task_load_time_sec"] = total_load_time
+                        combined_eddy_results["task_compute_time_sec"] = total_compute_time
+                        combined_eddy_results["task_total_time_sec"] = (
+                            total_load_time + total_compute_time
+                        )
+                        combined_eddy_results["pixels_in_task"] = len(eddy_results)
+
+                return (combined_lake_results, combined_eddy_results)
 
             task_dict[task_id] = process_chunk(verbose=verbose)
             task_id += 1
 
     return task_dict
-
-
-def compute_lake_characteristics(swirl_input_data, ds, nb_cores):
-    # Process lake characteristics in batches to control memory
-    n_times = len(swirl_input_data.times)
-    n_depths = len(swirl_input_data.depths)
-    batch_size_time = estimate_batch_size(
-        swirl_input_data.ds_mitgcm,
-        n_times,
-        n_depths,
-        nb_cores=nb_cores,
-        safety_factor=0.3,
-        account_for_overhead=True,
-        target_tasks_multiplier=1,
-    )
-
-    # Create delayed tasks for batches
-    lake_tasks = []
-
-    for t_start in range(0, n_times, batch_size_time):
-        t_end = min(t_start + batch_size_time, n_times)
-
-        @dask.delayed
-        def compute_lake_batch(t_start=t_start, t_end=t_end):
-            """Process a batch of time steps"""
-            batch_results = []
-
-            # Load entire batch at once (efficient!)
-            uvel_batch = ds.UVEL.isel(time=slice(t_start, t_end)).values
-            vvel_batch = ds.VVEL.isel(time=slice(t_start, t_end)).values
-            wvel_batch = ds.WVEL.isel(time=slice(t_start, t_end)).values
-            theta_batch = ds.THETA.isel(time=slice(t_start, t_end)).values
-
-            # Process each (time, depth) in the batch
-            for ti_batch, ti_global in enumerate(range(t_start, t_end)):
-                date = pd.to_datetime(
-                    swirl_input_data.times[ti_global]
-                ).to_pydatetime()
-                for di, depth_val in enumerate(swirl_input_data.depths):
-                    u = uvel_batch[ti_batch, di].T
-                    v = vvel_batch[ti_batch, di].T
-                    w = wvel_batch[ti_batch, di].T
-                    theta = theta_batch[ti_batch, di].T
-
-                    ke_slice = compute_ke_snapshot(
-                        u,
-                        v,
-                        w,
-                        swirl_input_data.dx,
-                        swirl_input_data.dy,
-                        dz=swirl_input_data.dz_array[di],
-                    ).sum()
-                    mean_temperature = theta[theta > 0].mean()
-                    surface = (
-                            len(theta[theta > 0])
-                            * swirl_input_data.dx
-                            * swirl_input_data.dy
-                    )
-                    volume = surface * swirl_input_data.dz_array[di]
-
-                    batch_results.append(
-                        {
-                            "time_index": ti_global,
-                            "depth_index": di,
-                            "date": date,
-                            "depth_[m]": depth_val,
-                            "surface_area_[m2]": surface,
-                            "volume_slice_[m3]": volume,
-                            "kinetic_energy_[MJ]": ke_slice,
-                            "mean_temperature_lake_[°C]": mean_temperature,
-                        }
-                    )
-
-            # CRITICAL: Delete large arrays before returning
-            del uvel_batch, vvel_batch, wvel_batch, theta_batch
-            gc.collect()
-
-            return batch_results
-
-        lake_tasks.append(compute_lake_batch())
-
-    print(f"  Created {len(lake_tasks)} lake characteristic tasks")
-    print(f"  Computing in parallel...")
-
-    # Compute all batches in parallel
-    lake_results = dask.compute(*lake_tasks)
-
-    # Flatten list of lists into single list
-    ke_lake = [item for batch in lake_results for item in batch]
-
-    return ke_lake
 
 
 def print_run_statistics(results, pp_config, total_start_time):
@@ -1163,7 +1036,7 @@ def print_run_statistics(results, pp_config, total_start_time):
     print("=" * 60)
 
 
-def compute_swirl_parallel_task(nb_cores, task_dict, client):
+def compute_parallel_tasks(nb_cores, task_dict, client):
     max_in_flight = nb_cores
     task_iter = iter(task_dict.items())
     futures_to_keys = {}
@@ -1233,7 +1106,7 @@ def load_input_data(pp_config, iter_number):
     return swirl_input_data
 
 
-def compute_postprocessing_for_one_iteration(pp_config, iter_number, nb_cores, verbose, client, total_start_time):
+def run_postprocessing_for_one_iteration(pp_config, iter_number, nb_cores, verbose, client, total_start_time):
     """
 
     :param pp_config:
@@ -1252,68 +1125,64 @@ def compute_postprocessing_for_one_iteration(pp_config, iter_number, nb_cores, v
     end_date_str = pd.Timestamp(swirl_input_data.times[-1]).strftime("%Y%m%d")
 
     # ---------------------------------
-    ds = swirl_input_data.ds_mitgcm
-
-    print(f"Computing lake characteristics... ({get_str_current_time()})")
-    ke_lake = compute_lake_characteristics(swirl_input_data, ds, nb_cores)
-
-    print(f"Saving lake characteristics... ({get_str_current_time()})")
-    lvl0_out_dir = os.path.join(pp_config["output_folder"], O_LVL0_FOLDER_NAME)
-    os.makedirs(lvl0_out_dir, exist_ok=True)
-    lake_csv_output_path = os.path.join(
-        lvl0_out_dir, f"lake_characteristics_{start_date_str}_{end_date_str}_{iter_number}.csv"
-    )
-    pd.DataFrame(ke_lake).to_csv(lake_csv_output_path, index=False)
-
     print(f"Preparing parallel tasks... ({get_str_current_time()})")
 
-    # Configure chunking (add to config file or hardcode)
-    time_chunk_size = pp_config.get("time_chunk_size", 1)  # Default: no chunking
-    depth_chunk_size = pp_config.get("depth_chunk_size", 1)  # Default: no chunking
+    # Estimate chunk size
+    time_chunk_size, depth_chunk_size = get_chunk_sizes(
+        pp_config.get("time_chunk_size", 1),
+        pp_config.get("depth_chunk_size", 1),
+        swirl_input_data.ds_mitgcm,
+        len(swirl_input_data.depths),
+        len(swirl_input_data.times),
+        nb_cores,
+        pp_config.get("target_tasks_multiplier", 3.0),
+        verbose=False)
 
     # Create chunked tasks
     task_dict = create_chunked_tasks(
         swirl_input_data,
         pp_config,
-        ds,
+        swirl_input_data.ds_mitgcm,
         nb_cores,
         time_chunk_size=time_chunk_size,
         depth_chunk_size=depth_chunk_size,
         target_tasks_multiplier=pp_config.get("target_tasks_multiplier", 3.0),
-        max_n_evc_points=pp_config.get("max_n_evc_points", 30000),
-        overhead_factor=pp_config.get("overhead_factor", 1.25),
         verbose=verbose,
     )
 
     # ---------------------------------
     print(f"Computing parallel tasks... ({get_str_current_time()})")
-    results = compute_swirl_parallel_task(nb_cores, task_dict, client)
+    results = compute_parallel_tasks(nb_cores, task_dict, client)
 
     print(f"Finished all tasks. Concatenating and saving to csv... ({get_str_current_time()})")
 
     valid_results = [
-        v for v in results.values() if isinstance(v, (pd.DataFrame, pd.Series))
+        v for v in results.values() if isinstance(v, (tuple, pd.Series)) and len(v) > 0
     ]
 
     if not valid_results:
         raise ValueError("No valid DataFrames found in results!")
 
-    df_catalogue_level0 = pd.concat(valid_results, ignore_index=True)
+    # Extract and concat dataframes for lake and eddies
+    lake_results = [v[0] for v in valid_results]
+    eddy_results = [v[1] for v in valid_results]
 
-    #df_catalogue_level0 = pd.concat(
-    #    [results[key] for key in sorted(results.keys())], ignore_index=True
-    #)
+    df_lake = pd.concat(lake_results, ignore_index=True)
+    df_catalogue_level0 = pd.concat(eddy_results, ignore_index=True)
 
     # ---------------------------------
     # Prepare output folder + CSV
-    output_path = os.path.join(
-        lvl0_out_dir, f"lvl0_{start_date_str}_{end_date_str}_{iter_number}.csv"
-    )
-    df_catalogue_level0.to_csv(output_path, index=False)
+    csv_output_folder = os.path.join(pp_config.get("output_folder"), O_LVL0_FOLDER_NAME)
+    df_lake.to_csv(
+        os.path.join(csv_output_folder, f"lake_characteristics_{start_date_str}_{end_date_str}_{iter_number}.csv"),
+        index=False)
+    df_catalogue_level0.to_csv(
+        os.path.join(csv_output_folder, f"lvl0_{start_date_str}_{end_date_str}_{iter_number}.csv"),
+        index=False)
 
-    print_run_statistics(valid_results, pp_config, total_start_time)
+    print_run_statistics(eddy_results, pp_config, total_start_time)
 
-    return ds
+    return swirl_input_data.ds_mitgcm
 
 
 def reformat_and_save_ds_to_netcdf(pp_config):
@@ -1331,7 +1200,6 @@ def reformat_and_save_ds_to_netcdf(pp_config):
     mitgcm_output_folder = os.path.join(
         pp_config["output_folder"], O_MITGCM_FOLDER_NAME
     )
-    os.makedirs(mitgcm_output_folder, exist_ok=True)
     start_date_str = pd.Timestamp(swirl_input_data.times[0]).strftime("%Y%m%d")
     end_date_str = pd.Timestamp(swirl_input_data.times[-1]).strftime("%Y%m%d")
     output_path = os.path.join(
@@ -1353,7 +1221,7 @@ def get_iter_numbers_from_filename(file_name:str):
     return nums
 
 
-def read_and_concat_csv(pp_config, prefix: str):
+def concat_and_save_csv(pp_config, prefix: str):
     out_dir = os.path.join(pp_config["output_folder"], O_LVL0_FOLDER_NAME)
     fname_base = os.path.join(out_dir, f"{prefix}_")
     flist = glob.glob(fname_base + "*.csv")
@@ -1389,11 +1257,17 @@ def main(config_path="config_postprocessing.json"):
     with open(config_path, "r") as f:
         pp_config = json.load(f)
 
+    output_folder = pp_config.get("output_folder")
+    print(f"Creating output folders in: {output_folder}")
+    os.makedirs(os.path.join(output_folder, O_FIGURE_FOLDER_NAME), exist_ok=True)
+    os.makedirs(os.path.join(output_folder, O_MITGCM_FOLDER_NAME), exist_ok=True)
+    os.makedirs(os.path.join(output_folder, O_LVL0_FOLDER_NAME), exist_ok=True)
+
     verbose = pp_config.get("verbose", False)
     nb_cores = get_number_of_cores(pp_config)
 
     # Setup SLURM-aware Dask client
-    client, cluster = setup_dask_client_slurm(
+    client, cluster = setup_dask_client(
         nb_cores, memory_per_worker="auto", verbose=verbose
     )
 
@@ -1416,22 +1290,15 @@ def main(config_path="config_postprocessing.json"):
         print(f"iterations: ")
         print(iters)
         for i in range(0, len(iters), pp_config.get("time_chunk_size", 1)):
+            print(f"\033[1;31mRunning iteration {i} out of {len(iters)}.\033[0m")
             iter_numbers = iters[i : i + pp_config.get("time_chunk_size", 1)]
-            ds = compute_postprocessing_for_one_iteration(pp_config, list(iter_numbers), nb_cores, verbose, client, total_start_time)
+            run_postprocessing_for_one_iteration(pp_config, list(iter_numbers), nb_cores, verbose, client, total_start_time)
             client.run(gc.collect)
 
         # ---------------------------------
         print(f"Finished all iterations. Concatenating and saving to final csv...")
-        read_and_concat_csv(pp_config, "lvl0")
-        read_and_concat_csv(pp_config, "lake_characteristics")
-
-        # ---------------------------------
-        print(f"Checking if MITgcm diverged... ({get_str_current_time()})")
-        last_theta_slice = ds.THETA.isel(time=-1, Z=0).values
-        if np.all(np.isnan(last_theta_slice)):
-            raise ValueError(
-                "Last time step of MITgcm results contains only NaN values."
-            )
+        concat_and_save_csv(pp_config, "lvl0")
+        concat_and_save_csv(pp_config, "lake_characteristics")
 
         # ---------------------------------
         print(f"Done. ({get_str_current_time()})")
@@ -1461,4 +1328,4 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
 
     freeze_support()
-    main('config_geneva_50m.json')
+    main(DEFAULT_CONFIG_NAME)
