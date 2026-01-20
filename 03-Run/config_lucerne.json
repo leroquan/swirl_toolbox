@@ -1,0 +1,21 @@
+{
+  "i_mitgcm_folder_path":  "/storage/alplakes_test/lucerne_100m_2025/outputs",
+  "swirl_params_path": "./swirl_params/swirl_06.param",
+  "output_folder": "/storage/alplakes_test/lucerne_2025/outputs_swirl",
+  "save_nc_mitgcm": false,
+  "grid_folder": "/storage/alplakes_test/lucerne_100m_2025/grid",
+  "cores": 50,
+  "time_chunk_size": 1,
+  "depth_chunk_size": 1,
+  "target_tasks_multiplier": 1,
+  "idx_z_cut": 50,
+  "mitgcm_output_format": "binary",
+  "binary_mitgcm_grid_folder_path":  "/storage/alplakes_test/lucerne_100m_2025/grid_metadata",
+  "binary_ref_date": "2025-01-01 0:0:0",
+  "binary_dt": 25,
+  "dt_save": 3600,
+  "nc_px": 1,
+  "nc_py": 1,
+  "verbose": true,
+  "iterations": "all"
+}
