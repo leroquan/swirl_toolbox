@@ -201,7 +201,7 @@ def load_input_data_netcdf(
 
     dx = float(ds_grid.dxC.values[0][0])
     dy = float(ds_grid.dyC.values[0][0])
-    dz_array = ds_grid.drC.values
+    dz_array = ds_grid.drF.values
 
     return SwirlInputData(ds_mitgcm, times, depths, dx, dy, dz_array)
 
@@ -240,6 +240,6 @@ def load_input_data_binary(
 
     dx = float(ds_mitgcm.dxC.values[0][0])
     dy = float(ds_mitgcm.dyC.values[0][0])
-    dz_array = ds_mitgcm.drC.values
+    dz_array = ds_mitgcm.drF.values
 
     return SwirlInputData(ds_mitgcm, times, depths, dx, dy, dz_array)
